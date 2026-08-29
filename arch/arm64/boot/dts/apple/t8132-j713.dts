@@ -20,7 +20,9 @@
 	aliases {
 		ans = &nvme;
 		ans-mbox = &ans_mbox;
+		pmu-primary = &pmic1;
 		sart-ans = &sart;
+		spmi-primary = &nub_spmi;
 	};
 
 	chosen {
@@ -42,4 +44,54 @@
 
 &fpwm1 {
 	status = "okay";
+};
+
+&smc {
+	status = "okay";
+
+	reboot {
+		compatible = "apple,t8132-smc-reboot", "apple,smc-reboot";
+		nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+			<&boot_error_count>, <&panic_count>;
+		nvmem-cell-names = "shutdown_flag", "boot_stage",
+			"boot_error_count", "panic_count";
+	};
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&nub_spmi {
+	status = "okay";
+
+	pmic1: pmic@0 {
+		compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+		reg = <0x0 SPMI_USID>; /* To be filled by loader */
+
+		nvmem-layout {
+			compatible = "fixed-layout";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			boot_stage: boot-stage@f801 {
+				reg = <0xf801 0x1>;
+			};
+
+			boot_error_count: boot-error-count@f802,0 {
+				reg = <0xf802 0x1>;
+				bits = <0 4>;
+			};
+
+			panic_count: panic-count@f802,4 {
+				reg = <0xf802 0x1>;
+				bits = <4 4>;
+			};
+
+			shutdown_flag: shutdown-flag@f80f,3 {
+				reg = <0xf80f 0x1>;
+				bits = <3 1>;
+			};
+		};
+	};
 };

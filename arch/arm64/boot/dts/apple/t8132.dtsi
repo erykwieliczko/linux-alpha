@@ -8,6 +8,7 @@
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,t8132", "apple,arm-platform";
@@ -272,6 +273,44 @@
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 507 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		nub_spmi: spmi@0 {
+			compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+			reg = <0x0 0x0 0x0 0x1000>; /* To be filled by loader */
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		smc: smc@38c600000 {
+			compatible = "apple,t8132-smc", "apple,t8103-smc";
+			reg = <0x3 0x8c600000 0x0 0x4000>,
+			      <0x3 0x8de00000 0x0 0x100000>;
+			reg-names = "smc", "sram";
+			mboxes = <&smc_mbox>;
+			status = "disabled";
+
+			smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+		};
+
+		smc_mbox: mbox@38c608000 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x8c608000 0x0 0x4000>;
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 561 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 562 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 563 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 564 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
 		};
 
 		pinctrl_nub: pinctrl@3881f0000 {
