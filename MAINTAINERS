@@ -1959,6 +1959,10 @@ L:	linux-pci@vger.kernel.org
 S:	Maintained
 F:	drivers/pci/controller/pcie-apple.c
 
+APPLE SILICON INHERITED DWC3 CONSOLE
+S:	Maintained
+F:	drivers/tty/serial/apple_dwc3_handoff*
+
 APPLE SMC DRIVER
 M:	Henrik Rydberg <rydberg@bitmath.org>
 L:	linux-hwmon@vger.kernel.org
