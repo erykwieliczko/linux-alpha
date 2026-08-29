@@ -30,6 +30,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
 #include <linux/reset.h>
+#include <linux/sizes.h>
 #include <linux/time64.h>
 
 #include "nvme.h"
@@ -52,6 +53,9 @@
 
 #define APPLE_ANS_LINEAR_ASQ_DB	 0x2490c
 #define APPLE_ANS_LINEAR_IOSQ_DB 0x24910
+
+#define APPLE_ANS_IOQ_SQ_BASE	 0x1200
+#define APPLE_ANS_IOQ_CQ_BASE	 0x1208
 
 #define APPLE_NVMMU_NUM_TCBS	  0x28100
 #define APPLE_NVMMU_ASQ_TCB_BASE  0x28108
@@ -167,6 +171,10 @@ struct apple_nvme_iod {
 
 struct apple_nvme_hw {
 	bool has_lsq_nvmmu;
+	bool has_separate_nvmmu;
+	bool needs_ioq_bases;
+	bool skip_set_queue_count;
+	u32 queue_alignment;
 	u32 max_queue_depth;
 };
 
@@ -175,6 +183,7 @@ struct apple_nvme {
 
 	void __iomem *mmio_coproc;
 	void __iomem *mmio_nvme;
+	void __iomem *mmio_nvmmu;
 	const struct apple_nvme_hw *hw;
 
 	struct device **pd_dev;
@@ -293,8 +302,8 @@ static void apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
-	writel(tag, anv->mmio_nvme + APPLE_NVMMU_TCB_INVAL);
-	if (readl(anv->mmio_nvme + APPLE_NVMMU_TCB_STAT))
+	writel(tag, anv->mmio_nvmmu + APPLE_NVMMU_TCB_INVAL);
+	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
 		dev_warn_ratelimited(anv->dev,
 				     "NVMMU TCB invalidation failed\n");
 }
@@ -1154,13 +1163,18 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
 
 		/* Allow as many pending command as possible for both queues */
-		writel(anv->hw->max_queue_depth
-			| (anv->hw->max_queue_depth << 16), anv->mmio_nvme
-			+ APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		if (anv->hw->has_separate_nvmmu)
+			writel((anv->hw->max_queue_depth - 1) |
+			       ((anv->hw->max_queue_depth - 1) << 16),
+			       anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		else
+			writel(anv->hw->max_queue_depth |
+			       (anv->hw->max_queue_depth << 16),
+			       anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
 
 		/* Setup the NVMMU for the maximum admin and IO queue depth */
 		writel(anv->hw->max_queue_depth - 1,
-			anv->mmio_nvme + APPLE_NVMMU_NUM_TCBS);
+			anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS);
 	}
 
 	/* Setup the admin queue */
@@ -1173,9 +1187,9 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
 		writeq(anv->adminq.tcb_dma_addr,
-			anv->mmio_nvme + APPLE_NVMMU_ASQ_TCB_BASE);
+			anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
 		writeq(anv->ioq.tcb_dma_addr,
-			anv->mmio_nvme + APPLE_NVMMU_IOSQ_TCB_BASE);
+			anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
 	}
 
 	anv->ctrl.sqsize =
@@ -1211,11 +1225,21 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (ret)
 		goto out_remove_cq;
 
+	if (anv->hw->needs_ioq_bases) {
+		/* Both queues must exist before programming these, CQ first. */
+		writeq(anv->ioq.cq_dma_addr,
+		       anv->mmio_nvme + APPLE_ANS_IOQ_CQ_BASE);
+		writeq(anv->ioq.sq_dma_addr,
+		       anv->mmio_nvme + APPLE_ANS_IOQ_SQ_BASE);
+	}
+
 	apple_nvme_init_queue(&anv->ioq);
 	nr_io_queues = 1;
-	ret = nvme_set_queue_count(&anv->ctrl, &nr_io_queues);
-	if (ret)
-		goto out_remove_sq;
+	if (!anv->hw->skip_set_queue_count) {
+		ret = nvme_set_queue_count(&anv->ctrl, &nr_io_queues);
+		if (ret)
+			goto out_remove_sq;
+	}
 	if (nr_io_queues != 1) {
 		ret = -ENXIO;
 		goto out_remove_sq;
@@ -1372,10 +1396,14 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 				  struct apple_nvme_queue *q)
 {
 	unsigned int depth = apple_nvme_queue_depth(q);
-	size_t iosq_size;
+	size_t cq_size, iosq_size, tcb_size;
+
+	cq_size = depth * sizeof(struct nvme_completion);
+	if (anv->hw->queue_alignment)
+		cq_size = ALIGN(cq_size, anv->hw->queue_alignment);
 
 	q->cqes = dmam_alloc_coherent(anv->dev,
-				      depth * sizeof(struct nvme_completion),
+				      cq_size,
 				      &q->cq_dma_addr, GFP_KERNEL);
 	if (!q->cqes)
 		return -ENOMEM;
@@ -1384,6 +1412,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		iosq_size = depth * sizeof(struct nvme_command);
 	else
 		iosq_size = depth << APPLE_NVME_IOSQES;
+	if (anv->hw->queue_alignment)
+		iosq_size = ALIGN(iosq_size, anv->hw->queue_alignment);
 
 	q->sqes = dmam_alloc_coherent(anv->dev, iosq_size,
 				      &q->sq_dma_addr, GFP_KERNEL);
@@ -1395,10 +1425,12 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		 * We need the maximum queue depth here because the NVMMU only
 		 * has a single depth configuration shared between both queues.
 		 */
-		q->tcbs = dmam_alloc_coherent(anv->dev,
-			anv->hw->max_queue_depth *
-				sizeof(struct apple_nvmmu_tcb),
-			&q->tcb_dma_addr, GFP_KERNEL);
+		tcb_size = anv->hw->max_queue_depth *
+			sizeof(struct apple_nvmmu_tcb);
+		if (anv->hw->queue_alignment)
+			tcb_size = ALIGN(tcb_size, anv->hw->queue_alignment);
+		q->tcbs = dmam_alloc_coherent(anv->dev, tcb_size,
+					      &q->tcb_dma_addr, GFP_KERNEL);
 		if (!q->tcbs)
 			return -ENOMEM;
 	}
@@ -1542,6 +1574,16 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	if (IS_ERR(anv->mmio_nvme)) {
 		ret = PTR_ERR(anv->mmio_nvme);
 		goto put_dev;
+	}
+	if (anv->hw->has_separate_nvmmu) {
+		anv->mmio_nvmmu =
+			devm_platform_ioremap_resource_byname(pdev, "nvmmu");
+		if (IS_ERR(anv->mmio_nvmmu)) {
+			ret = PTR_ERR(anv->mmio_nvmmu);
+			goto put_dev;
+		}
+	} else {
+		anv->mmio_nvmmu = anv->mmio_nvme;
 	}
 
 	if (anv->hw->has_lsq_nvmmu) {
@@ -1761,8 +1803,18 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.max_queue_depth = 64,
 };
 
+static const struct apple_nvme_hw apple_nvme_t8132_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_bases = true,
+	.skip_set_queue_count = true,
+	.queue_alignment = SZ_16K,
+	.max_queue_depth = 64,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
+	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
