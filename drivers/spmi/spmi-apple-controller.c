@@ -27,14 +27,6 @@
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
 
-/* SPMI Controller Registers */
-#define SPMI_STATUS_REG 0
-#define SPMI_CMD_REG 0x4
-#define SPMI_RSP_REG 0x8
-#define SPMI_ACT_REG 0xa4
-
-#define SPMI_IRQ_MASK_BASE 0x20
-#define SPMI_IRQ_ACK_BASE 0x60
 #define SPMI_NUM_PERIPHERAL_IRQS 256
 #define SPMI_NUM_IRQS (SPMI_NUM_PERIPHERAL_IRQS + 32)
 
@@ -47,13 +39,39 @@
 #define SPMI_REPLY_CMD GENMASK(7, 0)
 
 #define SPMI_ACT_FIFO_FLUSH BIT(0)
-#define SPMI_RX_FIFO_EMPTY BIT(24)
-
 #define REG_POLL_INTERVAL_US 10000
 #define REG_POLL_TIMEOUT_US (REG_POLL_INTERVAL_US * 5)
 
+struct apple_spmi_hw {
+	u32 status_reg;
+	u32 cmd_reg;
+	u32 rsp_reg;
+	u32 irq_mask_base;
+	u32 irq_ack_base;
+	u32 rx_fifo_empty;
+	bool supports_irq;
+};
+
+static const struct apple_spmi_hw apple_spmi_hw_gen1 = {
+	.status_reg = 0x00,
+	.cmd_reg = 0x04,
+	.rsp_reg = 0x08,
+	.irq_mask_base = 0x20,
+	.irq_ack_base = 0x60,
+	.rx_fifo_empty = BIT(24),
+	.supports_irq = true,
+};
+
+static const struct apple_spmi_hw apple_spmi_hw_gen4 = {
+	.status_reg = 0x200,
+	.cmd_reg = 0x210,
+	.rsp_reg = 0x220,
+	.rx_fifo_empty = BIT(30),
+};
+
 struct apple_spmi {
 	void __iomem *regs;
+	const struct apple_spmi_hw *hw;
 	struct mutex fifo_lock;
 	struct completion fifo_rx;
 	struct irq_domain *irqd;
@@ -70,21 +88,21 @@ struct apple_spmi {
 
 static void apple_spmi_irq_ack_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_ACK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_ack_base + (irq / 32) * 4;
 
 	writel(BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_mask_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_MASK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask_base + (irq / 32) * 4;
 
 	writel(readl(reg) & ~BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_unmask_raw(struct apple_spmi *spmi, u32 irq)
 {
-	u32 __iomem *reg = spmi->regs + SPMI_IRQ_MASK_BASE + (irq / 32) * 4;
+	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask_base + (irq / 32) * 4;
 
 	writel(readl(reg) | BIT(irq % 32), reg);
 }
@@ -135,12 +153,14 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 			usecs_to_jiffies(REG_POLL_TIMEOUT_US));
 		if (!ret)
 			ret = -ETIMEDOUT;
-		else if (readl(spmi->regs + SPMI_STATUS_REG) & SPMI_RX_FIFO_EMPTY)
+		else if (readl(spmi->regs + spmi->hw->status_reg) &
+			 spmi->hw->rx_fifo_empty)
 			ret = -EIO;
 		else
 			ret = 0;
 	} else {
-		ret = poll_reg(spmi, SPMI_STATUS_REG, status, !(status & SPMI_RX_FIFO_EMPTY));
+		ret = poll_reg(spmi, spmi->hw->status_reg, status,
+			       !(status & spmi->hw->rx_fifo_empty));
 	}
 
 	if (ret) {
@@ -166,19 +186,20 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	guard(mutex)(&spmi->fifo_lock);
 
 	if (spmi->prev_fail) {
-		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_RSP_REG);
-		apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
+		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + spmi->hw->rsp_reg);
+		if (spmi->notify_irq)
+			apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
 		spmi->prev_fail = false;
 	}
 	reinit_completion(&spmi->fifo_rx);
 
-	writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
+	writel(spmi_cmd, spmi->regs + spmi->hw->cmd_reg);
 
 	while (i < len) {
 		j = min_t(size_t, sizeof(spmi_cmd), len - i);
 		spmi_cmd = 0;
 		memcpy(&spmi_cmd, buf + i, j);
-		writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
+		writel(spmi_cmd, spmi->regs + spmi->hw->cmd_reg);
 		i += j;
 	}
 
@@ -186,23 +207,25 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	if (ret)
 		return ret;
 
-	reply = readl(spmi->regs + SPMI_RSP_REG);
+	reply = readl(spmi->regs + spmi->hw->rsp_reg);
 
 	/* Read SPMI data reply */
 	while (len_read < ilen) {
-		if (readl(spmi->regs + SPMI_STATUS_REG) & SPMI_RX_FIFO_EMPTY) {
+		if (readl(spmi->regs + spmi->hw->status_reg) &
+		    spmi->hw->rx_fifo_empty) {
 			spmi->prev_fail = true;
 			dev_err_ratelimited(&ctrl->dev,
 					    "FIFO lacks reply data, controller stuck?\n");
 			return -EIO;
 		}
-		rsp = readl(spmi->regs + SPMI_RSP_REG);
+		rsp = readl(spmi->regs + spmi->hw->rsp_reg);
 		i = min_t(size_t, sizeof(spmi_cmd), ilen - len_read);
 		memcpy(ibuf + len_read, &rsp, i);
 		len_read += i;
 	}
 
-	if (!(readl(spmi->regs + SPMI_STATUS_REG) & SPMI_RX_FIFO_EMPTY)) {
+	if (!(readl(spmi->regs + spmi->hw->status_reg) &
+	      spmi->hw->rx_fifo_empty)) {
 		dev_warn(&ctrl->dev, "FIFO has extra data\n");
 		spmi->prev_fail = true;
 	}
@@ -363,7 +386,8 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	unsigned long val, offset, bit;
 
 	chained_irq_enter(chip, desc);
-	val = readl(spmi->regs + SPMI_IRQ_ACK_BASE + (SPMI_IRQ_NOTIFY / 32) * 4);
+	val = readl(spmi->regs + spmi->hw->irq_ack_base +
+		    (SPMI_IRQ_NOTIFY / 32) * 4);
 	if (val & BIT(SPMI_IRQ_NOTIFY % 32)) {
 		apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
 		complete(&spmi->fifo_rx);
@@ -371,7 +395,7 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	}
 
 	for (offset = 0; offset < SPMI_NUM_PERIPHERAL_IRQS / 8; offset += sizeof(val)) {
-		val = readq(spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+		val = readq(spmi->regs + spmi->hw->irq_ack_base + offset);
 		/**
 		 * because of other masters in the bus, we're going to get a multitude of
 		 * interrupts we're not interested in. irq_resolve_mapping isn't very
@@ -411,8 +435,8 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
 	for (size_t offset = 0; offset < SPMI_NUM_IRQS / 8; offset += 4) {
-		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
-		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+		writel(0, spmi->regs + spmi->hw->irq_mask_base + offset);
+		writel(U32_MAX, spmi->regs + spmi->hw->irq_ack_base + offset);
 	}
 
 	spmi->irqd = devm_irq_domain_instantiate(&pdev->dev, &info);
@@ -441,6 +465,9 @@ static int apple_spmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	spmi = spmi_controller_get_drvdata(ctrl);
+	spmi->hw = device_get_match_data(&pdev->dev);
+	if (!spmi->hw)
+		return -EINVAL;
 	mutex_init(&spmi->fifo_lock);
 	init_completion(&spmi->fifo_rx);
 	platform_set_drvdata(pdev, spmi);
@@ -459,6 +486,9 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	if (spmi->irq < 0 && spmi->irq != -ENXIO)
 		return spmi->irq;
 	if (spmi->irq >= 0) {
+		if (!spmi->hw->supports_irq)
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "interrupt mode is unsupported by this controller\n");
 		ret = apple_spmi_init_irq(pdev, spmi, spmi->irq);
 		if (ret)
 			return ret;
@@ -473,8 +503,9 @@ static int apple_spmi_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_spmi_match_table[] = {
-	{ .compatible = "apple,t8103-spmi", },
-	{ .compatible = "apple,spmi", },
+	{ .compatible = "apple,t8132-spmi", .data = &apple_spmi_hw_gen4 },
+	{ .compatible = "apple,t8103-spmi", .data = &apple_spmi_hw_gen1 },
+	{ .compatible = "apple,spmi", .data = &apple_spmi_hw_gen1 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_spmi_match_table);
