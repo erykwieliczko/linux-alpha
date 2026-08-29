@@ -187,6 +187,47 @@
 		ranges;
 		nonposted-mmio;
 
+		/*
+		 * The ANS register addresses and interrupts are populated from the
+		 * live Apple device tree by m1n1.  Keeping these aliases stable lets
+		 * the same SoC description work across T8132 machines.
+		 */
+		ans_mbox: mbox@0 {
+			compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x0 0x0 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 2 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 3 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 4 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_ans>;
+		};
+
+		sart: iommu@10000 {
+			compatible = "apple,t8132-sart", "apple,t6000-sart";
+			reg = <0x0 0x10000 0x0 0x10000>;
+			power-domains = <&ps_ans>;
+		};
+
+		nvme: nvme@40000 {
+			compatible = "apple,t8132-nvme-ans2",
+				     "apple,t8103-nvme-ans2";
+			reg = <0x0 0x40000 0x0 0x40000>,
+			      <0x0 0x80000 0x0 0x40000>,
+			      <0x0 0xc0000 0x0 0x4000>;
+			reg-names = "nvme", "nvmmu", "ans";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 5 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&sart>;
+			power-domains = <&ps_ans>, <&ps_apcie_sys_st>;
+			power-domain-names = "ans", "apcie0";
+			resets = <&ps_ans>;
+		};
+
 		pmgr: power-management@380700000 {
 			compatible = "apple,t8132-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;

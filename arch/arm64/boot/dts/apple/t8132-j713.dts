@@ -17,6 +17,16 @@
 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M4, 2024)";
 
+	aliases {
+		ans = &nvme;
+		ans-mbox = &ans_mbox;
+		sart-ans = &sart;
+	};
+
+	chosen {
+		linux-enablement-mac,disk-boot;
+	};
+
 	led-controller {
 		compatible = "pwm-leds";
 		led-0 {
