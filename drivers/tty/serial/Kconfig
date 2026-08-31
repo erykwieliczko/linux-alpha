@@ -14,33 +14,6 @@ config SERIAL_EARLYCON
 	  the console before standard serial driver is probed. The console is
 	  enabled when early_param is processed.
 
-config SERIAL_APPLE_DWC3_HANDOFF
-	bool "Apple inherited DWC3 console handoff"
-	depends on ARM64 && ARCH_APPLE && OF
-	select SERIAL_CORE
-	select SERIAL_CORE_CONSOLE
-	select SERIAL_EARLYCON
-	help
-	  Adopt a live DWC3 debug console initialized by an earlier Apple boot
-	  stage. The controller, PHY and DART remain running and are not
-	  reinitialized. The inherited transport is available as earlycon and
-	  later as ttyM1. The runtime path is restricted to explicitly supported
-	  Apple machines and requires a validated handoff descriptor in /chosen.
-
-config APPLE_DWC3_HANDOFF_KUNIT_TEST
-	bool "KUnit tests for the Apple DWC3 handoff descriptor" if !KUNIT_ALL_TESTS
-	depends on KUNIT
-	default KUNIT_ALL_TESTS
-	help
-	  Test descriptor decoding, forward-compatible headers, physical and IOVA
-	  range checking, platform constraints and event-ring wraparound. These
-	  tests operate only on memory and do not access DWC3 hardware. Enable
-	  them with KUnit or KUNIT_ALL_TESTS.
-
-config APPLE_DWC3_HANDOFF
-	bool
-	default y if SERIAL_APPLE_DWC3_HANDOFF || APPLE_DWC3_HANDOFF_KUNIT_TEST
-
 source "drivers/tty/serial/8250/Kconfig"
 
 comment "Non-8250 serial port support"
