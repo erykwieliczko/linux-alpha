@@ -50,38 +50,6 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 };
 
-static bool apple_pmgr_ps_is_inherited_on(struct device_node *node,
-					  const char *name)
-{
-	struct device_node *chosen;
-	bool inherited;
-
-	if (of_property_read_bool(node, "apple,inherited-on"))
-		return true;
-
-	/*
-	 * The inherited DWC3 console is the consumer of the atc0_usb domain,
-	 * but it intentionally does not bind the native DWC3 device.  Treat the
-	 * handoff descriptor itself as an ownership marker for older m1n1 FDTs.
-	 */
-	if (strcmp(name, "atc0_usb"))
-		return false;
-	/* Older J713 m1n1 handoffs do not retain the marker in the live tree. */
-	if (of_machine_is_compatible("apple,j713"))
-		return true;
-
-	chosen = of_find_node_by_path("/chosen");
-	if (!chosen)
-		return false;
-
-	inherited = of_find_property(chosen,
-			"linux-enablement-mac,m1n1-dwc3-handoff", NULL) ||
-		    of_find_property(chosen, "tinyos,m1n1-dwc3-handoff", NULL);
-	of_node_put(chosen);
-
-	return inherited;
-}
-
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
 #define rcdev_to_apple_pmgr_ps(_rcdev) container_of(_rcdev, struct apple_pmgr_ps, rcdev)
 
@@ -269,7 +237,6 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	int ret;
 	const char *name;
 	bool active;
-	bool inherited_on;
 
 	regmap = syscon_node_to_regmap(node->parent);
 	if (IS_ERR(regmap))
@@ -314,11 +281,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->externally_clocked = true;
 
 	active = apple_pmgr_ps_is_active(ps);
-	inherited_on = apple_pmgr_ps_is_inherited_on(node, name);
-	if (of_property_read_bool(node, "apple,always-on") || inherited_on) {
+	if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
-		if (inherited_on)
-			dev_info(dev, "retaining inherited-on domain %s\n", name);
 		if (!active) {
 			dev_warn(dev, "always-on domain %s is not on at boot\n", name);
 			/* Turn it on so pm_genpd_init does not fail */
