@@ -990,6 +990,12 @@ static int apple_pcie_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	/*
+	 * AURORA_TODO:
+	 * Implement and validate Linux-owned T8132 controller and PHY setup.
+	 * The current handoff inherits both from m1n1.
+	 */
+	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }
