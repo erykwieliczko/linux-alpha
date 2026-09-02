@@ -24,7 +24,7 @@
 #include "apple_dwc3_handoff.h"
 
 #define HANDOFF_PROPERTY	"linux-enablement-mac,m1n1-dwc3-handoff"
-#define HANDOFF_MAX_REGIONS	32
+#define HANDOFF_MAX_REGIONS	128
 #define HANDOFF_TX_CHUNK	511
 #define HANDOFF_TX_TIMEOUT_US	250000
 #define HANDOFF_POLL_MS		1
@@ -87,6 +87,10 @@ struct handoff_state {
 	void *event_mapping;
 	void *xfer_mapping;
 	void *trb_mapping;
+	void *early_shared_mapping;
+	size_t xfer_mapping_size;
+	size_t trb_mapping_size;
+	size_t early_shared_mapping_size;
 	struct handoff_trb *tx_trb;
 	struct handoff_trb *rx_trb;
 	u8 *tx_buffer;
@@ -102,6 +106,7 @@ struct handoff_state {
 	bool early;
 	bool owns_descriptor;
 	bool owns_regs;
+	bool linear_mappings;
 };
 
 static DEFINE_SPINLOCK(handoff_lock);
@@ -113,7 +118,7 @@ static struct delayed_work handoff_poll_work;
 static struct handoff_platform_limits handoff_platform __initdata;
 
 static const struct apple_dwc3_handoff_region j713_mmio[] = {
-	{ 0x700000000ULL, SZ_1G },
+	{ 0x402280000ULL, APPLE_DWC3_REGS_SIZE },
 };
 
 static_assert(sizeof(struct apple_dwc3_handoff_raw) == 192);
@@ -165,10 +170,12 @@ static int __init find_wdt_node(unsigned long node, const char *uname,
 static int __init
 handoff_get_platform_limits(struct handoff_platform_limits *storage)
 {
-	struct memblock_region *region;
 	const void *fdt = initial_boot_params;
+	const __be32 *reg;
+	struct memblock_region *region;
 	u64 wdt_address = 0;
-	int count, i;
+	u64 base, size;
+	int node, entries, i;
 
 	if (!fdt ||
 	    !of_flat_dt_is_compatible(of_get_flat_dt_root(), "apple,j713") ||
@@ -186,14 +193,53 @@ handoff_get_platform_limits(struct handoff_platform_limits *storage)
 	if (!storage->limits.ram_count)
 		return -EINVAL;
 
-	count = fdt_num_mem_rsv(fdt);
-	if (count <= 0 || count > ARRAY_SIZE(storage->reserved))
-		return -EINVAL;
-	for (i = 0; i < count; i++) {
-		if (fdt_get_mem_rsv(fdt, i, &storage->reserved[i].start,
-				    &storage->reserved[i].size))
-			return -EINVAL;
+	for_each_reserved_mem_region(region) {
+		if (storage->limits.reserved_count ==
+		    ARRAY_SIZE(storage->reserved))
+			return -E2BIG;
+		storage->reserved[storage->limits.reserved_count].start =
+			region->base;
+		storage->reserved[storage->limits.reserved_count].size =
+			region->size;
+		storage->limits.reserved_count++;
 	}
+
+	/*
+	 * The EFI stub deliberately deletes header /memreserve/ entries and the
+	 * normal OF reserved-memory scan runs after earlycon setup.  Read static
+	 * reserved-memory children directly from the still-flat FDT so the early
+	 * consumer can validate producer-owned allocations without weakening the
+	 * reservation requirement.
+	 */
+	node = fdt_path_offset(fdt, "/reserved-memory");
+	if (node >= 0) {
+		int child;
+
+		fdt_for_each_subnode(child, fdt, node) {
+			const char *status = fdt_getprop(fdt, child, "status", NULL);
+
+			if (status && strcmp(status, "okay") && strcmp(status, "ok"))
+				continue;
+			reg = of_flat_dt_get_addr_size_prop(child, "reg", &entries);
+			if (!reg)
+				continue;
+			for (i = 0; i < entries; i++) {
+				if (storage->limits.reserved_count ==
+				    ARRAY_SIZE(storage->reserved))
+					return -E2BIG;
+				of_flat_dt_read_addr_size(reg, i, &base, &size);
+				if (!size)
+					continue;
+				storage->reserved[storage->limits.reserved_count].start =
+					base;
+				storage->reserved[storage->limits.reserved_count].size =
+					size;
+				storage->limits.reserved_count++;
+			}
+		}
+	}
+	if (!storage->limits.reserved_count)
+		return -EINVAL;
 
 	of_scan_flat_dt(find_wdt_node, &wdt_address);
 	if (!wdt_address)
@@ -201,7 +247,6 @@ handoff_get_platform_limits(struct handoff_platform_limits *storage)
 
 	storage->limits.ram = storage->ram;
 	storage->limits.reserved = storage->reserved;
-	storage->limits.reserved_count = count;
 	storage->limits.mmio = j713_mmio;
 	storage->limits.mmio_count = ARRAY_SIZE(j713_mmio);
 	storage->limits.expected_wdt_regs = wdt_address;
@@ -279,6 +324,9 @@ static bool handoff_same_layout(const struct apple_dwc3_handoff_desc *first,
 
 static void handoff_publish_state_locked(void)
 {
+	if (!handoff.descriptor)
+		return;
+
 	iowrite32(handoff.event_cursor,
 		  handoff.descriptor +
 		  offsetof(struct apple_dwc3_handoff_raw, event_buffer_offset));
@@ -540,13 +588,19 @@ out:
 static void __init handoff_unmap(struct handoff_state *state)
 {
 	if (state->early) {
-		if (state->trb_mapping)
+		if (state->descriptor && state->owns_descriptor)
+			early_memunmap(state->descriptor,
+				       sizeof(struct apple_dwc3_handoff_raw));
+		if (state->early_shared_mapping)
+			early_memunmap(state->early_shared_mapping,
+				       state->early_shared_mapping_size);
+		if (state->trb_mapping && !state->linear_mappings)
 			early_memunmap(state->trb_mapping,
-				       state->desc.trb_buffer_size);
-		if (state->xfer_mapping)
+				       state->trb_mapping_size);
+		if (state->xfer_mapping && !state->linear_mappings)
 			early_memunmap(state->xfer_mapping,
-				       state->desc.xfer_buffer_size);
-		if (state->event_mapping)
+				       state->xfer_mapping_size);
+		if (state->event_mapping && !state->linear_mappings)
 			early_memunmap(state->event_mapping,
 				       state->desc.event_buffer_size);
 		if (state->regs)
@@ -564,7 +618,7 @@ static void __init handoff_unmap(struct handoff_state *state)
 			release_mem_region(state->desc.regs_phys,
 					   APPLE_DWC3_REGS_SIZE);
 		if (state->descriptor && state->owns_descriptor)
-			iounmap(state->descriptor);
+			memunmap((void __force *)state->descriptor);
 	}
 	memset(state, 0, sizeof(*state));
 }
@@ -600,11 +654,13 @@ static int __init handoff_map_runtime(struct handoff_state *state, bool early)
 	u64 regs_phys = state->desc.regs_phys;
 	u64 trb_phys = state->desc.trb_buffer_phys;
 	u64 xfer_phys = state->desc.xfer_buffer_phys;
+	u64 shared_end, shared_phys, span_end;
 	size_t event_size = state->desc.event_buffer_size;
 	size_t trb_size = state->desc.trb_buffer_size;
 	size_t xfer_size = state->desc.xfer_buffer_size;
 
 	state->early = early;
+	state->linear_mappings = false;
 	if (early) {
 		state->regs = early_ioremap(regs_phys,
 					    APPLE_DWC3_REGS_SIZE);
@@ -619,22 +675,85 @@ static int __init handoff_map_runtime(struct handoff_state *state, bool early)
 	if (!state->regs)
 		goto nomem;
 
-	state->event_mapping = handoff_map_memory(early, event_phys, event_size);
-	state->xfer_mapping = handoff_map_memory(early, xfer_phys, xfer_size);
-	state->trb_mapping = handoff_map_memory(early, trb_phys, trb_size);
-	if (!state->event_mapping || !state->xfer_mapping ||
-	    !state->trb_mapping)
-		goto nomem;
+	if (early) {
+		/*
+		 * The retained arenas span several MiB.  The event ring and live TRBs
+		 * form one small cluster, while both live endpoint buffers form a
+		 * second.  Mapping those two minimal spans uses two scarce boot-time
+		 * fixmap slots instead of four and leaves EFI setup enough slots.
+		 */
+		shared_phys = event_phys;
+		if (check_add_overflow(event_phys, (u64)event_size, &shared_end))
+			goto invalid;
 
-	state->event_buffer = state->event_mapping;
-	state->tx_buffer = (u8 *)state->xfer_mapping +
-		(state->desc.tx_buffer_phys - state->desc.xfer_buffer_phys);
-	state->rx_buffer = (u8 *)state->xfer_mapping +
-		(state->desc.rx_buffer_phys - state->desc.xfer_buffer_phys);
-	state->tx_trb = (struct handoff_trb *)((u8 *)state->trb_mapping +
-		(state->desc.tx_trb_phys - state->desc.trb_buffer_phys));
-	state->rx_trb = (struct handoff_trb *)((u8 *)state->trb_mapping +
-		(state->desc.rx_trb_phys - state->desc.trb_buffer_phys));
+		shared_phys = min(shared_phys, state->desc.tx_trb_phys);
+		if (check_add_overflow(state->desc.tx_trb_phys,
+				       (u64)sizeof(*state->tx_trb), &span_end))
+			goto invalid;
+		shared_end = max(shared_end, span_end);
+		shared_phys = min(shared_phys, state->desc.rx_trb_phys);
+		if (check_add_overflow(state->desc.rx_trb_phys,
+				       (u64)sizeof(*state->rx_trb), &span_end))
+			goto invalid;
+		shared_end = max(shared_end, span_end);
+
+		state->early_shared_mapping_size = shared_end - shared_phys;
+		if (state->early_shared_mapping_size > SZ_256K)
+			goto invalid;
+		state->early_shared_mapping = early_memremap(
+			shared_phys, state->early_shared_mapping_size);
+		if (!state->early_shared_mapping)
+			goto nomem;
+
+		xfer_phys = min(state->desc.tx_buffer_phys,
+				state->desc.rx_buffer_phys);
+		if (check_add_overflow(max(state->desc.tx_buffer_phys,
+					   state->desc.rx_buffer_phys),
+				       (u64)state->desc.tx_max_packet, &span_end))
+			goto invalid;
+		xfer_size = span_end - xfer_phys;
+		if (xfer_size > SZ_256K)
+			goto invalid;
+		state->xfer_mapping = early_memremap(xfer_phys, xfer_size);
+		state->xfer_mapping_size = xfer_size;
+		if (!state->xfer_mapping)
+			goto nomem;
+
+		state->event_buffer = state->early_shared_mapping +
+			(event_phys - shared_phys);
+		state->tx_buffer = state->xfer_mapping +
+			(state->desc.tx_buffer_phys - xfer_phys);
+		state->rx_buffer = state->xfer_mapping +
+			(state->desc.rx_buffer_phys - xfer_phys);
+		state->tx_trb = (struct handoff_trb *)
+			(state->early_shared_mapping +
+			 (state->desc.tx_trb_phys - shared_phys));
+		state->rx_trb = (struct handoff_trb *)
+			(state->early_shared_mapping +
+			 (state->desc.rx_trb_phys - shared_phys));
+	} else {
+		state->event_mapping = handoff_map_memory(false, event_phys,
+						  event_size);
+		state->xfer_mapping = handoff_map_memory(false, xfer_phys,
+						  xfer_size);
+		state->trb_mapping = handoff_map_memory(false, trb_phys,
+						 trb_size);
+		if (!state->event_mapping || !state->xfer_mapping ||
+		    !state->trb_mapping)
+			goto nomem;
+		state->xfer_mapping_size = xfer_size;
+		state->trb_mapping_size = trb_size;
+
+		state->event_buffer = state->event_mapping;
+		state->tx_buffer = (u8 *)state->xfer_mapping +
+			(state->desc.tx_buffer_phys - state->desc.xfer_buffer_phys);
+		state->rx_buffer = (u8 *)state->xfer_mapping +
+			(state->desc.rx_buffer_phys - state->desc.xfer_buffer_phys);
+		state->tx_trb = (struct handoff_trb *)((u8 *)state->trb_mapping +
+			(state->desc.tx_trb_phys - state->desc.trb_buffer_phys));
+		state->rx_trb = (struct handoff_trb *)((u8 *)state->trb_mapping +
+			(state->desc.rx_trb_phys - state->desc.trb_buffer_phys));
+	}
 
 	if (handoff_validate_hardware(state)) {
 		handoff_unmap(state);
@@ -646,6 +765,10 @@ static int __init handoff_map_runtime(struct handoff_state *state, bool early)
 nomem:
 	handoff_unmap(state);
 	return -ENOMEM;
+
+invalid:
+	handoff_unmap(state);
+	return -EINVAL;
 }
 
 static int __init handoff_prepare_state(struct handoff_state *state,
@@ -688,19 +811,29 @@ static int __init handoff_earlycon_setup(struct earlycon_device *device,
 {
 	struct handoff_state state;
 	u64 property_address;
+	bool mapped_descriptor = false;
 	int ret;
 
-	if (!device->port.mapbase || !device->port.membase)
-		return -ENODEV;
-
 	ret = handoff_descriptor_phys(&property_address);
-	if (ret || property_address != device->port.mapbase)
+	if (ret)
+		return ret;
+	if (!device->port.mapbase && !device->port.membase) {
+		device->port.mapbase = property_address;
+		device->port.membase = early_memremap(property_address,
+					 sizeof(struct apple_dwc3_handoff_raw));
+		if (!device->port.membase)
+			return -ENOMEM;
+		mapped_descriptor = true;
+	}
+	if (!device->port.mapbase || !device->port.membase ||
+	    property_address != device->port.mapbase)
 		return -EINVAL;
 
 	ret = handoff_prepare_state(&state, true, device->port.membase,
 				    property_address);
 	if (ret)
 		return ret;
+	state.owns_descriptor = mapped_descriptor;
 
 	spin_lock(&handoff_lock);
 	handoff = state;
@@ -716,6 +849,18 @@ static int __init handoff_earlycon_setup(struct earlycon_device *device,
 
 	handoff_early_console = device->con;
 	device->con->write = handoff_console_write;
+	/*
+	 * The early fixmap has only seven slots and EFI setup still needs one.
+	 * Keep the decoded state locally until the normal runtime mapping takes
+	 * over, then republish the accumulated cursor and busy state.
+	 */
+	if (mapped_descriptor) {
+		early_memunmap(device->port.membase,
+			       sizeof(struct apple_dwc3_handoff_raw));
+		handoff.descriptor = NULL;
+		handoff.owns_descriptor = false;
+		device->port.membase = NULL;
+	}
 	return 0;
 }
 
@@ -810,12 +955,18 @@ static void handoff_poll(struct work_struct *work)
 	unsigned long flags;
 	size_t length, inserted;
 	u8 *buffer;
+	bool tx_wakeup;
 
 	spin_lock_irqsave(&handoff_lock, flags);
+	tx_wakeup = handoff.tx_busy;
 	handoff_handle_events_locked();
+	tx_wakeup &= !handoff.tx_busy;
 	buffer = handoff.rx_buffer + handoff.rx_offset;
 	length = handoff.rx_length;
 	spin_unlock_irqrestore(&handoff_lock, flags);
+
+	if (tx_wakeup)
+		tty_port_tty_wakeup(&handoff_tty_port);
 
 	if (length) {
 		inserted = tty_insert_flip_string(&handoff_tty_port, buffer, length);
@@ -850,6 +1001,9 @@ static int __init handoff_register_tty(void)
 
 	tty_port_init(&handoff_tty_port);
 	handoff_tty_port.ops = &port_ops;
+	handoff_tty_port.console = true;
+	tty_port_set_initialized(&handoff_tty_port, true);
+	tty_port_set_active(&handoff_tty_port, true);
 	driver->driver_name = "m1n1-dwc3-handoff";
 	driver->name = "ttyM";
 	driver->name_base = 1;
@@ -896,19 +1050,31 @@ static int __init handoff_late_init(void)
 					      &handoff_platform.limits))
 		return -EINVAL;
 
-	descriptor = ioremap(descriptor_phys,
-			     sizeof(struct apple_dwc3_handoff_raw));
+	descriptor = (__force void __iomem *)memremap(
+		descriptor_phys, sizeof(struct apple_dwc3_handoff_raw), MEMREMAP_WB);
 	if (!descriptor)
 		return -ENOMEM;
 
 	ret = handoff_prepare_state(&next, false, descriptor, descriptor_phys);
 	if (ret) {
-		iounmap(descriptor);
+		memunmap((void __force *)descriptor);
 		return ret;
 	}
 	next.owns_descriptor = true;
 
 	spin_lock_irqsave(&handoff_lock, flags);
+	if (handoff.active) {
+		iowrite32(handoff.event_cursor,
+			  descriptor + offsetof(struct apple_dwc3_handoff_raw,
+						event_buffer_offset));
+		iowrite32(handoff.tx_busy,
+			  descriptor + offsetof(struct apple_dwc3_handoff_raw,
+						tx_busy));
+		iowrite32(handoff.rx_busy,
+			  descriptor + offsetof(struct apple_dwc3_handoff_raw,
+						rx_busy));
+		wmb();
+	}
 	handoff_read_descriptor(descriptor, &raw);
 	ret = apple_dwc3_handoff_validate(&raw, descriptor_phys,
 					  &handoff_platform.limits, &latest);
