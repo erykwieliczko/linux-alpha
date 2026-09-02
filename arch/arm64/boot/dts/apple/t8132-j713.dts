@@ -23,6 +23,7 @@
 		pmu-primary = &pmic1;
 		sart-ans = &sart;
 		spmi-primary = &nub_spmi;
+		wifi0 = &wifi0;
 	};
 
 	chosen {
@@ -38,6 +39,79 @@
 			color = <LED_COLOR_ID_WHITE>;
 			max-brightness = <255>;
 			default-state = "keep";
+		};
+	};
+};
+
+/*
+ * m1n1 performs the T8132 controller and PHY initialization. Linux adopts
+ * the trained link and owns DART stream 16, RID-to-SID routing and MSI.
+ *
+ * AURORA_TODO: Determine and validate the T8132 DART fault interrupt, then
+ * describe it on dart_apcie0 and make it mandatory in the binding.
+ */
+&soc {
+	dart_apcie0: iommu@490000000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x90000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00010000 0x0 0x3fe00000>;
+	};
+
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t8132-pcie";
+		device_type = "pci";
+
+		reg = <0x1c 0xb0000000 0x0 0x10000000>, /* config */
+		      <0x4 0x94000000 0x0 0x4000>,     /* common */
+		      <0x4 0x90028000 0x0 0x8000>,     /* port 0 */
+		      <0x4 0x97020000 0x0 0x4000>;     /* port 0 PHY glue */
+		reg-names = "config", "rc", "port0", "phy0";
+
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>;
+
+		msi-controller;
+		msi-parent = <&pcie0>;
+		msi-ranges = <&aic AIC_IRQ 1506 IRQ_TYPE_EDGE_RISING 32>;
+
+		iommu-map = <0x100 &dart_apcie0 16 1>;
+		iommu-map-mask = <0xff00>;
+
+		bus-range = <0 1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges = <0x43000000 0xb 0xc0000000
+			  0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000
+			  0xb 0x80000000 0x0 0x40000000>;
+
+		port00: pci@0,0 {
+			device_type = "pci";
+			reg = <0x0 0x0 0x0 0x0 0x0>;
+			bus-range = <1 1>;
+			pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
+			reset-gpios = <&pinctrl_ap 163 GPIO_ACTIVE_LOW>;
+
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+					<0 0 0 2 &port00 0 0 0 1>,
+					<0 0 0 3 &port00 0 0 0 2>,
+					<0 0 0 4 &port00 0 0 0 3>;
+
+			wifi0: wifi@0,0 {
+				compatible = "pci14e4,4434";
+				reg = <0x10000 0x0 0x0 0x0 0x0>;
+				brcm,board-type = "apple,garden";
+				local-mac-address = [00 00 00 00 00 00];
+				apple,antenna-sku = "XX";
+			};
 		};
 	};
 };
