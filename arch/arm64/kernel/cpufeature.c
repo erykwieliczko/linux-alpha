@@ -1661,6 +1661,26 @@ has_cpuid_feature(const struct arm64_cpu_capabilities *entry, int scope)
 	return cpufeature_matches(val, entry);
 }
 
+static bool is_apple_m4_cpu(void)
+{
+	u32 midr = read_cpuid_id() & MIDR_CPU_MODEL_MASK;
+
+	return midr == MIDR_APPLE_M4_DONAN_E ||
+	       midr == MIDR_APPLE_M4_DONAN_P;
+}
+
+static bool has_safe_wfxt(const struct arm64_cpu_capabilities *entry,
+			  int scope)
+{
+	return !is_apple_m4_cpu() && has_cpuid_feature(entry, scope);
+}
+
+static bool has_safe_user_wfxt(const struct arm64_cpu_capabilities *entry,
+			       int scope)
+{
+	return !is_apple_m4_cpu() && has_user_cpuid_feature(entry, scope);
+}
+
 const struct cpumask *system_32bit_el0_cpumask(void)
 {
 	if (!system_supports_32bit_el0())
@@ -2996,7 +3016,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.desc = "WFx with timeout",
 		.capability = ARM64_HAS_WFXT,
 		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
-		.matches = has_cpuid_feature,
+		.matches = has_safe_wfxt,
 		ARM64_CPUID_FIELDS(ID_AA64ISAR2_EL1, WFxT, IMP)
 	},
 	{
@@ -3356,7 +3376,8 @@ static const struct arm64_cpu_capabilities arm64_elf_hwcaps[] = {
 	HWCAP_CAP(ID_AA64ISAR2_EL1, CSSC, CMPBR, CAP_HWCAP, KERNEL_HWCAP_CMPBR),
 	HWCAP_CAP(ID_AA64ISAR2_EL1, RPRFM, IMP, CAP_HWCAP, KERNEL_HWCAP_RPRFM),
 	HWCAP_CAP(ID_AA64ISAR2_EL1, RPRES, IMP, CAP_HWCAP, KERNEL_HWCAP_RPRES),
-	HWCAP_CAP(ID_AA64ISAR2_EL1, WFxT, IMP, CAP_HWCAP, KERNEL_HWCAP_WFXT),
+	HWCAP_CAP_MATCH_ID(has_safe_user_wfxt, ID_AA64ISAR2_EL1, WFxT, IMP,
+			   CAP_HWCAP, KERNEL_HWCAP_WFXT),
 	HWCAP_CAP(ID_AA64ISAR2_EL1, MOPS, IMP, CAP_HWCAP, KERNEL_HWCAP_MOPS),
 	HWCAP_CAP(ID_AA64ISAR2_EL1, BC, IMP, CAP_HWCAP, KERNEL_HWCAP_HBC),
 #ifdef CONFIG_ARM64_SME
