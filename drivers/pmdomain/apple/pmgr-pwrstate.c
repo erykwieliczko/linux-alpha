@@ -48,6 +48,7 @@ struct apple_pmgr_ps {
 	bool force_disable;
 	bool force_reset;
 	bool externally_clocked;
+	bool no_auto_enable;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -142,7 +143,10 @@ static bool apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
 
 static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 {
-	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
+	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
+
+	return apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE,
+				 !ps->no_auto_enable);
 }
 
 static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
@@ -236,7 +240,26 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	struct of_phandle_iterator it;
 	int ret;
 	const char *name;
-	bool active;
+	bool active, t8132;
+	u32 offset;
+
+	/*
+	 * AURORA_TODO:
+	 * The complete T8132 power-state table is not validated yet. Accessing
+	 * unrelated entries can raise an asynchronous SError on J713, so expose
+	 * only the domains exercised by the inherited storage/PCIe handoff.
+	 */
+	t8132 = of_device_is_compatible(node,
+					"apple,t8132-pmgr-pwrstate");
+	if (t8132 &&
+	    (of_property_read_u32(node, "reg", &offset) ||
+	     (offset != 0x188 && offset != 0x190 &&
+	      offset != 0x488 && offset != 0x490 &&
+	      offset != 0x530 && offset != 0x538 &&
+	      offset != 0x540 && offset != 0x548 &&
+	      offset != 0x4000 && offset != 0x4008 &&
+	      offset != 0x4010 && offset != 0x4018)))
+		return -ENODEV;
 
 	regmap = syscon_node_to_regmap(node->parent);
 	if (IS_ERR(regmap))
@@ -248,6 +271,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	ps->dev = dev;
 	ps->regmap = regmap;
+	/* m1n1 leaves automatic power gating disabled on T8132 domains. */
+	ps->no_auto_enable = t8132;
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret < 0) {
@@ -293,7 +318,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on */
-	if (active)
+	if (active && !ps->no_auto_enable)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
 

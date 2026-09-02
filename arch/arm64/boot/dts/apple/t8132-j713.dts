@@ -28,6 +28,9 @@
 
 	chosen {
 		linux-enablement-mac,disk-boot;
+		linux-enablement-mac,dapf-handoff = "/arm-io/aop", "/arm-io/mtp",
+			"/arm-io/pmp";
+		linux-enablement-mac,dapf-power-on-handoff = "/arm-io/pmp";
 	};
 
 	led-controller {
@@ -168,4 +171,16 @@
 			};
 		};
 	};
+};
+/*
+ * These blocks are initialized and retained by iBoot/DCP. Linux does not yet
+ * own the T8132 display power sequence, and the GPIO block must remain live
+ * for inherited firmware and input state.
+ */
+&framebuffer0 {
+	/delete-property/ power-domains;
+};
+
+&pinctrl_ap {
+	/delete-property/ power-domains;
 };
