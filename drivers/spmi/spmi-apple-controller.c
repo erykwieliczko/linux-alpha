@@ -38,7 +38,7 @@
 #define SPMI_REPLY_SLAVE_ID GENMASK(14, 8)
 #define SPMI_REPLY_CMD GENMASK(7, 0)
 
-#define SPMI_ACT_FIFO_FLUSH BIT(0)
+#define SPMI_FIFO_DRAIN_LIMIT 256
 #define REG_POLL_INTERVAL_US 10000
 #define REG_POLL_TIMEOUT_US (REG_POLL_INTERVAL_US * 5)
 
@@ -49,6 +49,7 @@ struct apple_spmi_hw {
 	u32 irq_mask_base;
 	u32 irq_ack_base;
 	u32 rx_fifo_empty;
+	u32 tx_fifo_empty;
 	bool supports_irq;
 };
 
@@ -59,14 +60,8 @@ static const struct apple_spmi_hw apple_spmi_hw_gen1 = {
 	.irq_mask_base = 0x20,
 	.irq_ack_base = 0x60,
 	.rx_fifo_empty = BIT(24),
+	.tx_fifo_empty = BIT(8),
 	.supports_irq = true,
-};
-
-static const struct apple_spmi_hw apple_spmi_hw_gen4 = {
-	.status_reg = 0x200,
-	.cmd_reg = 0x210,
-	.rsp_reg = 0x220,
-	.rx_fifo_empty = BIT(30),
 };
 
 struct apple_spmi {
@@ -79,7 +74,6 @@ struct apple_spmi {
 	DECLARE_BITMAP(irq_mask_cache, SPMI_NUM_PERIPHERAL_IRQS);
 	int irq;
 	bool notify_irq;
-	bool prev_fail;
 };
 
 #define poll_reg(spmi, reg, val, cond) \
@@ -141,6 +135,40 @@ static inline u32 apple_spmi_pack_cmd(u8 opc, u8 sid, u16 param)
 	return opc | sid << 8 | (u32)param << 16 | (1 << 15);
 }
 
+static int apple_spmi_prepare_fifos(struct spmi_controller *ctrl)
+{
+	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
+	u32 status;
+	unsigned int drained = 0;
+
+	status = readl(spmi->regs + spmi->hw->status_reg);
+	if (!(status & spmi->hw->tx_fifo_empty)) {
+		dev_err(&ctrl->dev, "TX FIFO has unsent commands (status %#x)\n",
+			status);
+		return -EIO;
+	}
+
+	while (!(status & spmi->hw->rx_fifo_empty)) {
+		if (drained == SPMI_FIFO_DRAIN_LIMIT) {
+			dev_err(&ctrl->dev, "failed to drain RX FIFO\n");
+			return -EIO;
+		}
+
+		readl(spmi->regs + spmi->hw->rsp_reg);
+		drained++;
+		status = readl(spmi->regs + spmi->hw->status_reg);
+	}
+
+	if (drained)
+		dev_warn(&ctrl->dev, "discarded %u stale RX words\n", drained);
+
+	if (spmi->notify_irq)
+		apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
+	reinit_completion(&spmi->fifo_rx);
+
+	return 0;
+}
+
 /* Wait for Rx FIFO to have something */
 static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 {
@@ -164,7 +192,6 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 	}
 
 	if (ret) {
-		spmi->prev_fail = true;
 		dev_err(&ctrl->dev,
 			"failed to wait for RX FIFO not empty\n");
 		return ret;
@@ -185,13 +212,9 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 
 	guard(mutex)(&spmi->fifo_lock);
 
-	if (spmi->prev_fail) {
-		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + spmi->hw->rsp_reg);
-		if (spmi->notify_irq)
-			apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
-		spmi->prev_fail = false;
-	}
-	reinit_completion(&spmi->fifo_rx);
+	ret = apple_spmi_prepare_fifos(ctrl);
+	if (ret)
+		return ret;
 
 	writel(spmi_cmd, spmi->regs + spmi->hw->cmd_reg);
 
@@ -213,7 +236,6 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	while (len_read < ilen) {
 		if (readl(spmi->regs + spmi->hw->status_reg) &
 		    spmi->hw->rx_fifo_empty) {
-			spmi->prev_fail = true;
 			dev_err_ratelimited(&ctrl->dev,
 					    "FIFO lacks reply data, controller stuck?\n");
 			return -EIO;
@@ -227,7 +249,6 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	if (!(readl(spmi->regs + spmi->hw->status_reg) &
 	      spmi->hw->rx_fifo_empty)) {
 		dev_warn(&ctrl->dev, "FIFO has extra data\n");
-		spmi->prev_fail = true;
 	}
 
 	if (!ilen && !FIELD_GET(SPMI_REPLY_ACK, reply)) {
@@ -503,7 +524,8 @@ static int apple_spmi_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_spmi_match_table[] = {
-	{ .compatible = "apple,t8132-spmi", .data = &apple_spmi_hw_gen4 },
+	/* The J713 ADT reports a Gen3 controller using the legacy layout. */
+	{ .compatible = "apple,t8132-spmi", .data = &apple_spmi_hw_gen1 },
 	{ .compatible = "apple,t8103-spmi", .data = &apple_spmi_hw_gen1 },
 	{ .compatible = "apple,spmi", .data = &apple_spmi_hw_gen1 },
 	{}
