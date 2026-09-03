@@ -28,6 +28,25 @@ description: >
 
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-atcphy
+    then:
+      properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          maxItems: 2
+    else:
+      properties:
+        reg:
+          minItems: 5
+        reg-names:
+          minItems: 5
+      required:
+        - power-domains
 
 $defs:
   apple,tunable:
@@ -54,23 +73,33 @@ properties:
               - apple,t6020-atcphy
               - apple,t8112-atcphy
           - const: apple,t8103-atcphy
-      - const: apple,t8103-atcphy
+      - enum:
+          - apple,t8103-atcphy
+          - apple,t8132-atcphy
 
   reg:
-    items:
-      - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-      - description: DisplayPort Alternate Mode PHY specific controls
-      - description: Type-C PHY AXI to Apple Fabric interconnect controls
-      - description: USB2 PHY specific controls
-      - description: USB3 PIPE interface controls
+    oneOf:
+      - items:
+          - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+          - description: DisplayPort Alternate Mode PHY specific controls
+          - description: Type-C PHY AXI to Apple Fabric interconnect controls
+          - description: USB2 PHY specific controls
+          - description: USB3 PIPE interface controls
+      - items:
+          - description: USB2 PHY specific controls
+          - description: USB3 PIPE interface controls
 
   reg-names:
-    items:
-      - const: core
-      - const: lpdptx
-      - const: axi2af
-      - const: usb2phy
-      - const: pipehandler
+    oneOf:
+      - items:
+          - const: core
+          - const: lpdptx
+          - const: axi2af
+          - const: usb2phy
+          - const: pipehandler
+      - items:
+          - const: usb2phy
+          - const: pipehandler
 
   "#phy-cells":
     const: 1
@@ -159,7 +188,6 @@ required:
   - "#reset-cells"
   - orientation-switch
   - mode-switch
-  - power-domains
   - ports
 
 additionalProperties: false
