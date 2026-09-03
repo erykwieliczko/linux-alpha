@@ -75,6 +75,10 @@ enum dwc3_apple_state {
 	DWC3_APPLE_DEVICE, /* Cable connected, dwc3 in device mode */
 };
 
+struct dwc3_apple_hw {
+	bool has_cio;
+};
+
 /**
  * struct dwc3_apple - Apple-specific DWC3 USB controller
  * @dwc: Core DWC3 structure
@@ -90,6 +94,7 @@ struct dwc3_apple {
 	struct dwc3 dwc;
 
 	struct device *dev;
+	const struct dwc3_apple_hw *hw;
 	struct resource *mmio_resource;
 	void __iomem *apple_regs;
 
@@ -257,7 +262,8 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 * Now that the core is initialized and already went through dwc3_core_soft_reset we can
 	 * configure some unknown Apple-specific settings and then bring up xhci or gadget mode.
 	 */
-	dwc3_apple_setup_cio(appledwc);
+	if (appledwc->hw->has_cio)
+		dwc3_apple_setup_cio(appledwc);
 
 	switch (state) {
 	case DWC3_APPLE_HOST:
@@ -443,6 +449,9 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
+	appledwc->hw = device_get_match_data(dev);
+	if (!appledwc->hw)
+		return -EINVAL;
 	mutex_init(&appledwc->lock);
 
 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
@@ -501,8 +510,15 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 		dwc3_core_remove(&appledwc->dwc);
 }
 
+static const struct dwc3_apple_hw dwc3_apple_hw_full = {
+	.has_cio = true,
+};
+
+static const struct dwc3_apple_hw dwc3_apple_hw_t8132 = {};
+
 static const struct of_device_id dwc3_apple_of_match[] = {
-	{ .compatible = "apple,t8103-dwc3" },
+	{ .compatible = "apple,t8132-dwc3", .data = &dwc3_apple_hw_t8132 },
+	{ .compatible = "apple,t8103-dwc3", .data = &dwc3_apple_hw_full },
 	{}
 };
 MODULE_DEVICE_TABLE(of, dwc3_apple_of_match);

@@ -492,6 +492,9 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_DUMMY_PHY_EN BIT(15)
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
+#define PIPEHANDLER_T8132_USB2_CONFIG 0x44
+#define PIPEHANDLER_T8132_USB2_CONFIG_EN BIT(2)
+
 #define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
 
 /* USB2 PHY regs */
@@ -511,7 +514,8 @@ enum atcphy_lane_mode {
 #define USB2PHY_SIG_VBUSDET_FORCE_EN BIT(1)
 #define USB2PHY_SIG_VBUSVLDEXT_FORCE_VAL BIT(2)
 #define USB2PHY_SIG_VBUSVLDEXT_FORCE_EN BIT(3)
-#define USB2PHY_SIG_HOST (7 << 12)
+#define USB2PHY_SIG_HOST_T8103 GENMASK(14, 12)
+#define USB2PHY_SIG_HOST_T8132 GENMASK(6, 4)
 
 #define USB2PHY_MISCTUNE 0x1c
 #define USB2PHY_MISCTUNE_APBCLK_GATE_OFF BIT(29)
@@ -520,6 +524,7 @@ enum atcphy_lane_mode {
 enum atcphy_generation {
 	ATCPHY_GENERATION_T8103,
 	ATCPHY_GENERATION_T8122,
+	ATCPHY_GENERATION_T8132,
 };
 
 enum atcphy_dp_link_rate {
@@ -599,6 +604,9 @@ struct atcphy_hw {
 	enum atcphy_generation gen;
 	int aciophy_lane_mode;
 	int aciophy_crossbar;
+	u32 usb2phy_sig_host;
+	bool has_full_atc;
+	bool needs_usb2_pipehandler_config;
 };
 
 /**
@@ -1273,6 +1281,10 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 {
 	lockdep_assert_held(&atcphy->lock);
 
+	if (atcphy->hw->needs_usb2_pipehandler_config)
+		set32(atcphy->regs.pipehandler + PIPEHANDLER_T8132_USB2_CONFIG,
+		      PIPEHANDLER_T8132_USB2_CONFIG_EN);
+
 	mask32(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK,
 	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_OFF));
 	udelay(10);
@@ -1870,6 +1882,18 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 
 	lockdep_assert_held(&atcphy->lock);
 
+	if (!atcphy->hw->has_full_atc) {
+		if (mode == APPLE_ATCPHY_MODE_OFF)
+			atcphy_usb2_power_off(atcphy);
+		else if (mode == APPLE_ATCPHY_MODE_USB2)
+			atcphy_usb2_power_on(atcphy);
+		else
+			return -EOPNOTSUPP;
+
+		atcphy->mode = mode;
+		return 0;
+	}
+
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
 		ret = atcphy_power_off(atcphy);
 		atcphy->mode = mode;
@@ -1969,10 +1993,12 @@ static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
-		set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+		set32(atcphy->regs.usb2phy + USB2PHY_SIG,
+		      atcphy->hw->usb2phy_sig_host);
 		break;
 	case PHY_MODE_USB_DEVICE:
-		clear32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
+		clear32(atcphy->regs.usb2phy + USB2PHY_SIG,
+			atcphy->hw->usb2phy_sig_host);
 		break;
 	default:
 		return -EINVAL;
@@ -2116,16 +2142,23 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
 static struct phy *atcphy_xlate(struct device *dev, const struct of_phandle_args *args)
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+	struct phy *phy;
 
 	switch (args->args[0]) {
 	case PHY_TYPE_USB2:
-		return atcphy->phys.usb2;
+		phy = atcphy->phys.usb2;
+		break;
 	case PHY_TYPE_USB3:
-		return atcphy->phys.usb3;
+		phy = atcphy->phys.usb3;
+		break;
 	case PHY_TYPE_DP:
-		return atcphy->phys.dp;
+		phy = atcphy->phys.dp;
+		break;
+	default:
+		return ERR_PTR(-ENODEV);
 	}
-	return ERR_PTR(-ENODEV);
+
+	return phy ?: ERR_PTR(-ENODEV);
 }
 
 static int atcphy_probe_phy(struct apple_atcphy *atcphy)
@@ -2140,6 +2173,9 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
+		if (!atcphy->hw->has_full_atc && i != 0)
+			continue;
+
 		*phys[i].phy = devm_phy_create(atcphy->dev, NULL, phys[i].ops);
 		if (IS_ERR(*phys[i].phy))
 			return PTR_ERR(*phys[i].phy);
@@ -2270,7 +2306,8 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	if (state->mode == TYPEC_STATE_SAFE) {
 		target_mode = APPLE_ATCPHY_MODE_OFF;
 	} else if (state->mode == TYPEC_STATE_USB) {
-		target_mode = APPLE_ATCPHY_MODE_USB3;
+		target_mode = atcphy->hw->has_full_atc ?
+			APPLE_ATCPHY_MODE_USB3 : APPLE_ATCPHY_MODE_USB2;
 	} else if (!state->alt && state->mode == TYPEC_MODE_USB4) {
 		struct enter_usb_data *data = state->data;
 		u32 eudo_usb_mode = FIELD_GET(EUDO_USB_MODE_MASK, data->eudo);
@@ -2368,6 +2405,10 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 		{ "apple,tunable-lane0-dp", &atcphy->tunables.lane_dp[0], atcphy->res.core },
 		{ "apple,tunable-lane1-dp", &atcphy->tunables.lane_dp[1], atcphy->res.core },
 	};
+
+	if (!atcphy->hw->has_full_atc)
+		return 0;
+
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122) {
 		tunable_count = ARRAY_SIZE(tunables) - 2;
 		atcphy->tunables.lane_dp[0] = NULL;
@@ -2395,16 +2436,19 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 		void __iomem **addr;
 		struct resource **res;
 	} resources[] = {
+		{ "usb2phy", &atcphy->regs.usb2phy, NULL },
+		{ "pipehandler", &atcphy->regs.pipehandler, NULL },
 		{ "core", &atcphy->regs.core, &atcphy->res.core },
 		{ "lpdptx", &atcphy->regs.lpdptx, NULL },
 		{ "axi2af", &atcphy->regs.axi2af, &atcphy->res.axi2af },
-		{ "usb2phy", &atcphy->regs.usb2phy, NULL },
-		{ "pipehandler", &atcphy->regs.pipehandler, NULL },
 	};
 	struct resource *res;
 	void __iomem *addr;
 
 	for (int i = 0; i < ARRAY_SIZE(resources); i++) {
+		if (!atcphy->hw->has_full_atc && i >= 2)
+			continue;
+
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, resources[i].name);
 		addr = devm_ioremap_resource(&pdev->dev, res);
 		if (IS_ERR(addr))
@@ -2430,7 +2474,8 @@ static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 
 	/* Reset atcphy to clear any state potentially left by the bootloader */
 	atcphy_usb2_power_off(atcphy);
-	atcphy_power_off(atcphy);
+	if (atcphy->hw->has_full_atc)
+		atcphy_power_off(atcphy);
 	atcphy_setup_pipehandler(atcphy);
 
 	ret = atcphy_probe_rcdev(atcphy);
@@ -2485,15 +2530,26 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.gen = ATCPHY_GENERATION_T8103,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
+	.usb2phy_sig_host = USB2PHY_SIG_HOST_T8103,
+	.has_full_atc = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8122 = {
 	.gen = ATCPHY_GENERATION_T8122,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.usb2phy_sig_host = USB2PHY_SIG_HOST_T8103,
+	.has_full_atc = true,
+};
+
+static const struct atcphy_hw atcphy_hw_t8132 = {
+	.gen = ATCPHY_GENERATION_T8132,
+	.usb2phy_sig_host = USB2PHY_SIG_HOST_T8132,
+	.needs_usb2_pipehandler_config = true,
 };
 
 static const struct of_device_id atcphy_match[] = {
+	{ .compatible = "apple,t8132-atcphy", .data = &atcphy_hw_t8132 },
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{},
