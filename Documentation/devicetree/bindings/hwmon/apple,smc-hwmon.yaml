@@ -40,6 +40,14 @@ properties:
   compatible:
     const: apple,smc-hwmon
 
+  apple,thermal-pressure-key:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^[A-Za-z0-9]{4}$"
+    description:
+      SMC FourCC key containing a signed, read-only thermal-pressure state.
+      This value is platform firmware telemetry and is not a temperature or
+      thermal policy control.
+
 patternProperties:
   "^current-[A-Za-z0-9]{4}$":
     $ref: "#/$defs/sensor"
