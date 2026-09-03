@@ -10,4 +10,15 @@ config HID_DOCKCHANNEL
 	  The keyboard and touchpad are HID based devices connected via the
 	  proprietary DockChannel interface.
 
+config HID_DOCKCHANNEL_KUNIT_TEST
+	tristate "KUnit tests for DockChannel HID" if !KUNIT_ALL_TESTS
+	depends on KUNIT && HID_DOCKCHANNEL
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for hardware-independent DockChannel HID protocol helpers.
+	  These verify command serialization without requiring Apple hardware.
+	  The tests are intended for kernel developers working on the Apple MTP
+	  keyboard and multi-touch transport.
+	  If in doubt, say N.
+
 endmenu
