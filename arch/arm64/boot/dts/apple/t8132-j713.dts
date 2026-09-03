@@ -247,6 +247,12 @@
 &smc {
 	status = "okay";
 
+	rtc {
+		compatible = "apple,smc-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
+	};
+
 	reboot {
 		compatible = "apple,t8132-smc-reboot", "apple,smc-reboot";
 		nvmem-cells = <&shutdown_flag>, <&boot_stage>,
@@ -271,6 +277,10 @@
 			compatible = "fixed-layout";
 			#address-cells = <1>;
 			#size-cells = <1>;
+
+			rtc_offset: rtc-offset@2100 {
+				reg = <0x2100 0x6>;
+			};
 
 			boot_stage: boot-stage@f801 {
 				reg = <0xf801 0x1>;
