@@ -13,6 +13,8 @@
 #include "t8132-jxxx.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
@@ -56,6 +58,123 @@
  * describe it on dart_apcie0 and make it mandatory in the binding.
  */
 &soc {
+	nub_spmi_a0: spmi@388908000 {
+		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x88908000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
+
+		hpm1: usb-pd@a {
+			compatible = "apple,t8132-sn201202x", "apple,sn201202x";
+			reg = <0xa SPMI_USID>;
+			interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+				     <43 IRQ_TYPE_EDGE_RISING>,
+				     <45 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "irq", "sleep", "wake";
+
+			typec1: connector {
+				compatible = "usb-c-connector";
+				label = "USB-C MagSafe-adjacent";
+				power-role = "dual";
+				data-role = "dual";
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						typec1_connector_hs: endpoint {
+							remote-endpoint = <&dwc3_1_hs>;
+						};
+					};
+
+					port@1 {
+						reg = <1>;
+						typec1_connector_ss: endpoint {
+							remote-endpoint = <&atcphy1_typec_lanes>;
+						};
+					};
+				};
+			};
+		};
+	};
+
+	atcphy1: phy@40aa90000 {
+		compatible = "apple,t8132-atcphy";
+		reg = <0x4 0x0aa90000 0x0 0x4000>,
+		      <0x4 0x0aa84000 0x0 0x4000>;
+		reg-names = "usb2phy", "pipehandler";
+
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		orientation-switch;
+		mode-switch;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				atcphy1_typec_lanes: endpoint {
+					remote-endpoint = <&typec1_connector_ss>;
+				};
+			};
+		};
+	};
+
+	dwc3_1_dart_0: iommu@40af00000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x0af00000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1345 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+	};
+
+	dwc3_1_dart_1: iommu@40af80000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x0af80000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1345 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+	};
+
+	dwc3_1: usb@40a280000 {
+		compatible = "apple,t8132-dwc3";
+		reg = <0x4 0x0a280000 0x0 0xcd00>,
+		      <0x4 0x0a28cd00 0x0 0x3200>;
+		reg-names = "dwc3-core", "dwc3-apple";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1341 IRQ_TYPE_LEVEL_HIGH>;
+
+		dr_mode = "otg";
+		maximum-speed = "high-speed";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+
+		iommus = <&dwc3_1_dart_0 0>, <&dwc3_1_dart_1 1>;
+		resets = <&atcphy1>;
+		phys = <&atcphy1 PHY_TYPE_USB2>;
+		phy-names = "usb2-phy";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dwc3_1_hs: endpoint {
+					remote-endpoint = <&typec1_connector_hs>;
+				};
+			};
+		};
+	};
+
 	dart_apcie0: iommu@490000000 {
 		compatible = "apple,t8132-dart", "apple,t8110-dart";
 		reg = <0x4 0x90000000 0x0 0x20000>;
