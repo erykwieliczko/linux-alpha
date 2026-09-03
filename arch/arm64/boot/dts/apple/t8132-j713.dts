@@ -11,6 +11,7 @@
 
 #include "t8132.dtsi"
 #include "t8132-jxxx.dtsi"
+#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/leds/common.h>
 
 / {
@@ -20,6 +21,7 @@
 	aliases {
 		ans = &nvme;
 		ans-mbox = &ans_mbox;
+		keyboard = &keyboard;
 		pmu-primary = &pmic1;
 		sart-ans = &sart;
 		spmi-primary = &nub_spmi;
@@ -172,6 +174,41 @@
 		};
 	};
 };
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
+	apple,stm-reset-gpios = <&smc_gpio 29 GPIO_ACTIVE_LOW>;
+
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j713.bin";
+		apple,power-method = <2>;
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+
+	stm {
+	};
+};
+
 /*
  * These blocks are initialized and retained by iBoot/DCP. Linux does not yet
  * own the T8132 display power sequence, and the GPIO block must remain live
