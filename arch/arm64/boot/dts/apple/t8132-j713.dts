@@ -247,6 +247,31 @@
 &smc {
 	status = "okay";
 
+	hwmon {
+		compatible = "apple,smc-hwmon";
+		apple,thermal-pressure-key = "mTPL";
+
+		temperature-TB0T {
+			apple,key-id = "TB0T";
+			label = "Battery Hotspot";
+		};
+
+		temperature-TCHP {
+			apple,key-id = "TCHP";
+			label = "Charge Regulator Temp";
+		};
+
+		temperature-TH0x {
+			apple,key-id = "TH0x";
+			label = "NAND Flash Temperature";
+		};
+
+		temperature-TW0P {
+			apple,key-id = "TW0P";
+			label = "WiFi/BT Module Temp";
+		};
+	};
+
 	rtc {
 		compatible = "apple,smc-rtc";
 		nvmem-cells = <&rtc_offset>;
