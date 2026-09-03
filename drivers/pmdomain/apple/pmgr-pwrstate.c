@@ -254,6 +254,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (t8132 &&
 	    (of_property_read_u32(node, "reg", &offset) ||
 	     (offset != 0x188 && offset != 0x190 &&
+	      offset != 0x278 && /* fpwm1 */
+	      offset != 0x2d8 && /* uart_p */
+	      offset != 0x3d8 && /* uart0 */
 	      offset != 0x488 && offset != 0x490 &&
 	      offset != 0x530 && offset != 0x538 &&
 	      offset != 0x540 && offset != 0x548 &&
