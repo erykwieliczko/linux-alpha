@@ -104,6 +104,15 @@ static const struct apple_soc_cpufreq_info soc_t8112_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+static const struct apple_soc_cpufreq_info soc_t8132_info = {
+	.has_ps2 = false,
+	.max_pstate = 31,
+	/* AURORA_TODO: validate the T8132 status-register p-state field. */
+	.cur_pstate_mask = 0,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct apple_soc_cpufreq_info soc_default_info = {
 	.has_ps2 = false,
 	.max_pstate = 15,
@@ -124,6 +133,10 @@ static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
 	{
 		.compatible = "apple,t8112-cluster-cpufreq",
 		.data = &soc_t8112_info,
+	},
+	{
+		.compatible = "apple,t8132-cluster-cpufreq",
+		.data = &soc_t8132_info,
 	},
 	{
 		.compatible = "apple,cluster-cpufreq",
