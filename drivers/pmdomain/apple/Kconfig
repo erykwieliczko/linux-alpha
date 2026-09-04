@@ -18,6 +18,8 @@ config APPLE_PMP_REPORT
 	bool "Apple PMP report control"
 	depends on OF
 	depends on PM
+	depends on HAS_IOMEM
+	select HWMON
 	select PM_GENERIC_DOMAINS
 
 endif
