@@ -219,6 +219,30 @@ struct apple_nvme {
 	struct delayed_work flush_dwork;
 };
 
+static void __iomem *apple_nvme_ioremap_coproc(struct platform_device *pdev,
+					       const struct apple_nvme_hw *hw)
+{
+	struct resource coproc;
+	struct resource *res;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ans");
+	if (!res)
+		return IOMEM_ERR_PTR(-EINVAL);
+
+	/*
+	 * T8132 describes one broad ASC aperture containing the separately
+	 * owned mailbox registers.  The NVMe driver only uses its control page.
+	 */
+	if (!hw->has_separate_nvmmu)
+		return devm_ioremap_resource(&pdev->dev, res);
+	if (resource_size(res) < SZ_4K)
+		return IOMEM_ERR_PTR(-EINVAL);
+
+	coproc = *res;
+	coproc.end = coproc.start + SZ_4K - 1;
+	return devm_ioremap_resource(&pdev->dev, &coproc);
+}
+
 unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
@@ -350,6 +374,20 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 		tcb->dma_flags = APPLE_ANS_TCB_DMA_FROM_DEVICE;
 
 	memcpy(&q->sqes[tag], cmd, sizeof(*cmd));
+
+	if (q->is_adminq) {
+		dev_info(anv->dev,
+			 "REMOVE-DEBUG submit admin op=%#x cid=%#x tag=%u sq=%pad cq=%pad tcb=%pad db=%#x\n",
+			 cmd->common.opcode, le16_to_cpu(cmd->common.command_id),
+			 tag, &q->sq_dma_addr, &q->cq_dma_addr,
+			 &q->tcb_dma_addr, readl(q->sq_db));
+		print_hex_dump(KERN_INFO, "REMOVE-DEBUG sqe: ",
+			       DUMP_PREFIX_OFFSET, 16, 1, &q->sqes[tag],
+			       sizeof(*cmd), false);
+		print_hex_dump(KERN_INFO, "REMOVE-DEBUG tcb: ",
+			       DUMP_PREFIX_OFFSET, 16, 1, tcb,
+			       sizeof(*tcb), false);
+	}
 
 	/*
 	 * This lock here doesn't make much sense at a first glance but
@@ -965,6 +1003,24 @@ static enum blk_eh_timer_return apple_nvme_timeout(struct request *req)
 	unsigned long flags;
 	u32 csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
 
+	dev_info(anv->dev,
+		 "REMOVE-DEBUG timeout cpu=%#x boot=%#x cc=%#x csts=%#x aqa=%#x asq=%#llx acq=%#llx lsq=%#x pend=%#x ntcb=%#x atcb=%#llx itcb=%#llx acqdb=%#x\n",
+		 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+		 readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS),
+		 readl(anv->mmio_nvme + NVME_REG_CC), csts,
+		 readl(anv->mmio_nvme + NVME_REG_AQA),
+		 readq(anv->mmio_nvme + NVME_REG_ASQ),
+		 readq(anv->mmio_nvme + NVME_REG_ACQ),
+		 readl(anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL),
+		 readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL),
+		 readl(anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS),
+		 readq(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE),
+		 readq(anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE),
+		 readl(anv->mmio_nvme + APPLE_ANS_ACQ_DB));
+	print_hex_dump(KERN_INFO, "REMOVE-DEBUG cqe: ", DUMP_PREFIX_OFFSET,
+		       16, 1, q->cqes, sizeof(*q->cqes) *
+		       apple_nvme_queue_depth(q), false);
+
 	if (nvme_ctrl_state(&anv->ctrl) != NVME_CTRL_LIVE) {
 		/*
 		 * From rdma.c:
@@ -1074,6 +1130,10 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		container_of(work, struct apple_nvme, ctrl.reset_work);
 	enum nvme_ctrl_state state = nvme_ctrl_state(&anv->ctrl);
 
+	dev_info(anv->dev, "REMOVE-DEBUG reset entry cpu=%#x boot=%#x\n",
+		 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+		 readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS));
+
 	if (state != NVME_CTRL_RESETTING) {
 		dev_warn(anv->dev, "ctrl state %d is not RESETTING\n", state);
 		ret = -ENODEV;
@@ -1111,6 +1171,9 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		ret = reset_control_assert(anv->reset);
 		if (ret)
 			goto out;
+		dev_info(anv->dev, "REMOVE-DEBUG reset asserted cpu=%#x boot=%#x\n",
+			 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+			 readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS));
 
 		ret = apple_rtkit_reinit(anv->rtk);
 		if (ret)
@@ -1119,6 +1182,9 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		ret = reset_control_deassert(anv->reset);
 		if (ret)
 			goto out;
+		dev_info(anv->dev, "REMOVE-DEBUG reset deasserted cpu=%#x boot=%#x\n",
+			 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+			 readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS));
 
 		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
@@ -1132,6 +1198,9 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		dev_err(anv->dev, "ANS did not boot");
 		goto out;
 	}
+	dev_info(anv->dev, "REMOVE-DEBUG rtkit ready cpu=%#x boot=%#x\n",
+		 readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+		 readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS));
 
 	ret = readl_poll_timeout(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS,
 				 boot_status,
@@ -1195,11 +1264,24 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	anv->ctrl.sqsize =
 		anv->hw->max_queue_depth - 1; /* 0's based queue depth */
 	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
+	dev_info(anv->dev,
+		 "REMOVE-DEBUG pre-enable cap=%#llx aqa=%#x asq=%#llx acq=%#llx lsq=%#x pend=%#x ntcb=%#x atcb=%#llx itcb=%#llx\n",
+		 anv->ctrl.cap, readl(anv->mmio_nvme + NVME_REG_AQA),
+		 readq(anv->mmio_nvme + NVME_REG_ASQ),
+		 readq(anv->mmio_nvme + NVME_REG_ACQ),
+		 readl(anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL),
+		 readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL),
+		 readl(anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS),
+		 readq(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE),
+		 readq(anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE));
 
 	dev_dbg(anv->dev, "Enabling controller now");
 	ret = nvme_enable_ctrl(&anv->ctrl);
 	if (ret)
 		goto out;
+	dev_info(anv->dev, "REMOVE-DEBUG enabled cc=%#x csts=%#x\n",
+		 readl(anv->mmio_nvme + NVME_REG_CC),
+		 readl(anv->mmio_nvme + NVME_REG_CSTS));
 
 	dev_dbg(anv->dev, "Starting admin queue");
 	apple_nvme_init_queue(&anv->adminq);
@@ -1367,9 +1449,9 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 	anv->tagset.nr_hw_queues = 1;
 	anv->tagset.nr_maps = 1;
 	/*
-	 * Tags are used as an index to the NVMMU and must be unique across
-	 * both queues. The admin queue gets the first APPLE_NVME_AQ_DEPTH which
-	 * must be marked as reserved in the IO queue.
+	 * Older controllers share an NVMMU tag space across both queues, so the
+	 * admin tags must be reserved in the I/O tagset.  T8132 provides separate
+	 * admin and I/O TCB arrays and therefore uses the full tag space in each.
 	 */
 	anv->tagset.reserved_tags = APPLE_NVME_AQ_DEPTH;
 	anv->tagset.queue_depth = anv->hw->max_queue_depth - 1;
@@ -1565,7 +1647,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto put_dev;
 	}
 
-	anv->mmio_coproc = devm_platform_ioremap_resource_byname(pdev, "ans");
+	anv->mmio_coproc = apple_nvme_ioremap_coproc(pdev, anv->hw);
 	if (IS_ERR(anv->mmio_coproc)) {
 		ret = PTR_ERR(anv->mmio_coproc);
 		goto put_dev;
