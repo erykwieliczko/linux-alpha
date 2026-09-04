@@ -25,6 +25,7 @@
 		ans-mbox = &ans_mbox;
 		keyboard = &keyboard;
 		pmu-primary = &pmic1;
+		pmp = &pmp;
 		sart-ans = &sart;
 		spmi-primary = &nub_spmi;
 		wifi0 = &wifi0;
@@ -104,10 +105,46 @@
 		};
 	};
 
+	pmp_dart: iommu@380300000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x3 0x80300000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 881 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_pmp>;
+	};
+
 	pmp_report: pmp-report@3803c0000 {
 		compatible = "apple,t8132-pmp-v2-report";
 		reg = <0x3 0x803c0000 0x0 0x20000>;
 		power-domains = <&ps_pms_sram>;
+	};
+
+	pmp: pmp@380500000 {
+		compatible = "apple,t8132-pmp-v2", "apple,t6000-pmp-v2";
+		reg = <0x3 0x80500000 0x0 0x80000>,
+		      <0x3 0x80e00000 0x0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&pmp_dart 0>;
+		power-domains = <&ps_pmp>;
+		/* m1n1 supplies board/DRAM parameters and tunables before enabling. */
+		status = "disabled";
+	};
+
+	pmp_mbox: mailbox@380e08000 {
+		compatible = "apple,t8132-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x80e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 877 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 878 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 879 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 880 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_pmp>, <&ps_pms_sram>;
 	};
 
 	atcphy1: phy@40aa90000 {
