@@ -76,12 +76,10 @@ allOf:
   - if:
       properties:
         compatible:
-          contains:
-            const: apple,t8132-dart
+          not:
+            contains:
+              const: apple,t8132-dart
     then:
-      properties:
-        interrupts: false
-    else:
       required:
         - interrupts
 
