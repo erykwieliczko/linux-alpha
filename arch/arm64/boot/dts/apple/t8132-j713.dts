@@ -104,6 +104,12 @@
 		};
 	};
 
+	pmp_report: pmp-report@3803c0000 {
+		compatible = "apple,t8132-pmp-v2-report";
+		reg = <0x3 0x803c0000 0x0 0x20000>;
+		power-domains = <&ps_pms_sram>;
+	};
+
 	atcphy1: phy@40aa90000 {
 		compatible = "apple,t8132-atcphy";
 		reg = <0x4 0x0aa90000 0x0 0x4000>,
@@ -374,4 +380,12 @@
 
 &pinctrl_ap {
 	/delete-property/ power-domains;
+};
+
+&ps_pmp {
+	apple,inherited-on;
+};
+
+&ps_pms_sram {
+	apple,inherited-on;
 };
