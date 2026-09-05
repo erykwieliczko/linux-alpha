@@ -30,7 +30,8 @@
 
 #include "drm_sysfb_helper.h"
 
-#define DRIVER_NAME	"simpledrm"
+/* Temporary workaround for Hyprland software-rendering detection. */
+#define DRIVER_NAME	"softpipe"
 #define DRIVER_DESC	"DRM driver for simple-framebuffer platform devices"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
