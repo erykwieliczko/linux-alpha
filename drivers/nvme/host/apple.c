@@ -30,6 +30,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sart.h>
 #include <linux/reset.h>
+#include <linux/sizes.h>
 #include <linux/time64.h>
 
 #include "nvme.h"
@@ -52,6 +53,9 @@
 
 #define APPLE_ANS_LINEAR_ASQ_DB	 0x2490c
 #define APPLE_ANS_LINEAR_IOSQ_DB 0x24910
+
+#define APPLE_ANS_IOQ_SQ_BASE	 0x1200
+#define APPLE_ANS_IOQ_CQ_BASE	 0x1208
 
 #define APPLE_NVMMU_NUM_TCBS	  0x28100
 #define APPLE_NVMMU_ASQ_TCB_BASE  0x28108
@@ -167,6 +171,12 @@ struct apple_nvme_iod {
 
 struct apple_nvme_hw {
 	bool has_lsq_nvmmu;
+	bool has_separate_nvmmu;
+	bool needs_ioq_bases;
+	bool skip_set_queue_count;
+	bool requires_cold_start;
+	bool strict_flush;
+	u32 queue_alignment;
 	u32 max_queue_depth;
 };
 
@@ -175,6 +185,7 @@ struct apple_nvme {
 
 	void __iomem *mmio_coproc;
 	void __iomem *mmio_nvme;
+	void __iomem *mmio_nvmmu;
 	const struct apple_nvme_hw *hw;
 
 	struct device **pd_dev;
@@ -209,6 +220,30 @@ struct apple_nvme {
 	unsigned long last_flush;
 	struct delayed_work flush_dwork;
 };
+
+static void __iomem *apple_nvme_ioremap_coproc(struct platform_device *pdev,
+					       const struct apple_nvme_hw *hw)
+{
+	struct resource coproc;
+	struct resource *res;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "ans");
+	if (!res)
+		return IOMEM_ERR_PTR(-EINVAL);
+
+	/*
+	 * T8132 describes one broad ASC aperture containing the separately
+	 * owned mailbox registers.  The NVMe driver only uses its control page.
+	 */
+	if (!hw->has_separate_nvmmu)
+		return devm_ioremap_resource(&pdev->dev, res);
+	if (resource_size(res) < SZ_4K)
+		return IOMEM_ERR_PTR(-EINVAL);
+
+	coproc = *res;
+	coproc.end = coproc.start + SZ_4K - 1;
+	return devm_ioremap_resource(&pdev->dev, &coproc);
+}
 
 unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
@@ -293,8 +328,8 @@ static void apple_nvmmu_inval(struct apple_nvme_queue *q, unsigned int tag)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
 
-	writel(tag, anv->mmio_nvme + APPLE_NVMMU_TCB_INVAL);
-	if (readl(anv->mmio_nvme + APPLE_NVMMU_TCB_STAT))
+	writel(tag, anv->mmio_nvmmu + APPLE_NVMMU_TCB_INVAL);
+	if (readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT))
 		dev_warn_ratelimited(anv->dev,
 				     "NVMMU TCB invalidation failed\n");
 }
@@ -1115,6 +1150,9 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
 
 		ret = apple_rtkit_boot(anv->rtk);
+	} else if (anv->hw->requires_cold_start) {
+		dev_err(anv->dev, "bootloader left ANS running without a Linux RTKit session\n");
+		ret = -EBUSY;
 	} else {
 		ret = apple_rtkit_wake(anv->rtk);
 	}
@@ -1123,7 +1161,6 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		dev_err(anv->dev, "ANS did not boot");
 		goto out;
 	}
-
 	ret = readl_poll_timeout(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS,
 				 boot_status,
 				 boot_status == APPLE_ANS_BOOT_STATUS_OK,
@@ -1154,13 +1191,18 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
 
 		/* Allow as many pending command as possible for both queues */
-		writel(anv->hw->max_queue_depth
-			| (anv->hw->max_queue_depth << 16), anv->mmio_nvme
-			+ APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		if (anv->hw->has_separate_nvmmu)
+			writel((anv->hw->max_queue_depth - 1) |
+			       ((anv->hw->max_queue_depth - 1) << 16),
+			       anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		else
+			writel(anv->hw->max_queue_depth |
+			       (anv->hw->max_queue_depth << 16),
+			       anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
 
 		/* Setup the NVMMU for the maximum admin and IO queue depth */
 		writel(anv->hw->max_queue_depth - 1,
-			anv->mmio_nvme + APPLE_NVMMU_NUM_TCBS);
+			anv->mmio_nvmmu + APPLE_NVMMU_NUM_TCBS);
 	}
 
 	/* Setup the admin queue */
@@ -1173,20 +1215,18 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
 		writeq(anv->adminq.tcb_dma_addr,
-			anv->mmio_nvme + APPLE_NVMMU_ASQ_TCB_BASE);
+			anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
 		writeq(anv->ioq.tcb_dma_addr,
-			anv->mmio_nvme + APPLE_NVMMU_IOSQ_TCB_BASE);
+			anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
 	}
 
 	anv->ctrl.sqsize =
 		anv->hw->max_queue_depth - 1; /* 0's based queue depth */
 	anv->ctrl.cap = readq(anv->mmio_nvme + NVME_REG_CAP);
-
 	dev_dbg(anv->dev, "Enabling controller now");
 	ret = nvme_enable_ctrl(&anv->ctrl);
 	if (ret)
 		goto out;
-
 	dev_dbg(anv->dev, "Starting admin queue");
 	apple_nvme_init_queue(&anv->adminq);
 	nvme_unquiesce_admin_queue(&anv->ctrl);
@@ -1211,11 +1251,21 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (ret)
 		goto out_remove_cq;
 
+	if (anv->hw->needs_ioq_bases) {
+		/* Both queues must exist before programming these, CQ first. */
+		writeq(anv->ioq.cq_dma_addr,
+		       anv->mmio_nvme + APPLE_ANS_IOQ_CQ_BASE);
+		writeq(anv->ioq.sq_dma_addr,
+		       anv->mmio_nvme + APPLE_ANS_IOQ_SQ_BASE);
+	}
+
 	apple_nvme_init_queue(&anv->ioq);
 	nr_io_queues = 1;
-	ret = nvme_set_queue_count(&anv->ctrl, &nr_io_queues);
-	if (ret)
-		goto out_remove_sq;
+	if (!anv->hw->skip_set_queue_count) {
+		ret = nvme_set_queue_count(&anv->ctrl, &nr_io_queues);
+		if (ret)
+			goto out_remove_sq;
+	}
 	if (nr_io_queues != 1) {
 		ret = -ENXIO;
 		goto out_remove_sq;
@@ -1343,9 +1393,9 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 	anv->tagset.nr_hw_queues = 1;
 	anv->tagset.nr_maps = 1;
 	/*
-	 * Tags are used as an index to the NVMMU and must be unique across
-	 * both queues. The admin queue gets the first APPLE_NVME_AQ_DEPTH which
-	 * must be marked as reserved in the IO queue.
+	 * Older controllers share an NVMMU tag space across both queues, so the
+	 * admin tags must be reserved in the I/O tagset. Keep that conservative
+	 * reservation on T8132 too, despite its separate TCB arrays.
 	 */
 	anv->tagset.reserved_tags = APPLE_NVME_AQ_DEPTH;
 	anv->tagset.queue_depth = anv->hw->max_queue_depth - 1;
@@ -1372,10 +1422,14 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 				  struct apple_nvme_queue *q)
 {
 	unsigned int depth = apple_nvme_queue_depth(q);
-	size_t iosq_size;
+	size_t cq_size, iosq_size, tcb_size;
+
+	cq_size = depth * sizeof(struct nvme_completion);
+	if (anv->hw->queue_alignment)
+		cq_size = ALIGN(cq_size, anv->hw->queue_alignment);
 
 	q->cqes = dmam_alloc_coherent(anv->dev,
-				      depth * sizeof(struct nvme_completion),
+				      cq_size,
 				      &q->cq_dma_addr, GFP_KERNEL);
 	if (!q->cqes)
 		return -ENOMEM;
@@ -1384,6 +1438,8 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		iosq_size = depth * sizeof(struct nvme_command);
 	else
 		iosq_size = depth << APPLE_NVME_IOSQES;
+	if (anv->hw->queue_alignment)
+		iosq_size = ALIGN(iosq_size, anv->hw->queue_alignment);
 
 	q->sqes = dmam_alloc_coherent(anv->dev, iosq_size,
 				      &q->sq_dma_addr, GFP_KERNEL);
@@ -1395,10 +1451,12 @@ static int apple_nvme_queue_alloc(struct apple_nvme *anv,
 		 * We need the maximum queue depth here because the NVMMU only
 		 * has a single depth configuration shared between both queues.
 		 */
-		q->tcbs = dmam_alloc_coherent(anv->dev,
-			anv->hw->max_queue_depth *
-				sizeof(struct apple_nvmmu_tcb),
-			&q->tcb_dma_addr, GFP_KERNEL);
+		tcb_size = anv->hw->max_queue_depth *
+			sizeof(struct apple_nvmmu_tcb);
+		if (anv->hw->queue_alignment)
+			tcb_size = ALIGN(tcb_size, anv->hw->queue_alignment);
+		q->tcbs = dmam_alloc_coherent(anv->dev, tcb_size,
+					      &q->tcb_dma_addr, GFP_KERNEL);
 		if (!q->tcbs)
 			return -ENOMEM;
 	}
@@ -1497,6 +1555,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_nvme *anv;
+	u64 quirks = NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
+		NVME_QUIRK_ADMIN_PAGE_ALIGN;
 	int ret;
 
 	anv = devm_kzalloc(dev, sizeof(*anv), GFP_KERNEL);
@@ -1533,7 +1593,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto put_dev;
 	}
 
-	anv->mmio_coproc = devm_platform_ioremap_resource_byname(pdev, "ans");
+	anv->mmio_coproc = apple_nvme_ioremap_coproc(pdev, anv->hw);
 	if (IS_ERR(anv->mmio_coproc)) {
 		ret = PTR_ERR(anv->mmio_coproc);
 		goto put_dev;
@@ -1542,6 +1602,16 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	if (IS_ERR(anv->mmio_nvme)) {
 		ret = PTR_ERR(anv->mmio_nvme);
 		goto put_dev;
+	}
+	if (anv->hw->has_separate_nvmmu) {
+		anv->mmio_nvmmu =
+			devm_platform_ioremap_resource_byname(pdev, "nvmmu");
+		if (IS_ERR(anv->mmio_nvmmu)) {
+			ret = PTR_ERR(anv->mmio_nvmmu);
+			goto put_dev;
+		}
+	} else {
+		anv->mmio_nvmmu = anv->mmio_nvme;
 	}
 
 	if (anv->hw->has_lsq_nvmmu) {
@@ -1627,9 +1697,10 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto put_dev;
 	}
 
-	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops,
-			     NVME_QUIRK_SKIP_CID_GEN | NVME_QUIRK_IDENTIFY_CNS |
-			     NVME_QUIRK_ADMIN_PAGE_ALIGN);
+	if (anv->hw->strict_flush)
+		quirks |= NVME_QUIRK_FORCE_WRITE_CACHE_NO_FUA;
+
+	ret = nvme_init_ctrl(&anv->ctrl, anv->dev, &nvme_ctrl_ops, quirks);
 	if (ret) {
 		dev_err_probe(dev, ret, "Failed to initialize nvme_ctrl");
 		goto put_dev;
@@ -1662,7 +1733,8 @@ static int apple_nvme_probe(struct platform_device *pdev)
 		goto out_uninit_ctrl;
 	}
 
-	if (flush_interval) {
+	/* T8132 must not acknowledge a flush before the command completes. */
+	if (flush_interval && !anv->hw->strict_flush) {
 		anv->flush_interval = msecs_to_jiffies(flush_interval);
 		anv->flush_ns = NULL;
 		anv->last_flush = jiffies - anv->flush_interval;
@@ -1761,8 +1833,20 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
 	.max_queue_depth = 64,
 };
 
+static const struct apple_nvme_hw apple_nvme_t8132_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_bases = true,
+	.skip_set_queue_count = true,
+	.requires_cold_start = true,
+	.strict_flush = true,
+	.queue_alignment = SZ_16K,
+	.max_queue_depth = 64,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
+	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
