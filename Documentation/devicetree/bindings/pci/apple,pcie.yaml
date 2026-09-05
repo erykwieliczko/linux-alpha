@@ -44,6 +44,7 @@ properties:
       - items:
           - const: apple,t8122-pcie
           - const: apple,t6020-pcie
+      - const: apple,t8132-pcie
       - const: apple,t6020-pcie
 
   reg:
