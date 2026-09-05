@@ -85,6 +85,7 @@ struct dwc3_apple_hw {
  * @dev: Pointer to the device structure
  * @mmio_resource: Resource to be passed to dwc3_core_probe
  * @apple_regs: Apple-specific DWC3 registers
+ * @usb2_phy: USB2 PHY acquired before the first role switch
  * @reset: Reset control
  * @role_sw: USB role switch
  * @lock: Mutex for synchronizing access
@@ -98,6 +99,7 @@ struct dwc3_apple {
 	struct resource *mmio_resource;
 	void __iomem *apple_regs;
 
+	struct phy *usb2_phy;
 	struct reset_control *reset;
 	struct usb_role_switch *role_sw;
 
@@ -176,6 +178,7 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 {
 	struct dwc3_probe_data probe_data = {};
+	void *group;
 	int ret;
 
 	lockdep_assert_held(&appledwc->lock);
@@ -188,9 +191,20 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	probe_data.skip_core_init_mode = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
 
+	/* A role-switch failure does not unbind the parent and release devres. */
+	group = devres_open_group(appledwc->dev, NULL, GFP_KERNEL);
+	if (!group)
+		return -ENOMEM;
+
 	ret = dwc3_core_probe(&probe_data);
-	if (ret)
+	if (ret) {
+		devres_release_group(appledwc->dev, group);
+		/* Drop cached PHY pointers and readiness flags with their resources. */
+		memset(&appledwc->dwc, 0, sizeof(appledwc->dwc));
+		appledwc->dwc.dev = appledwc->dev;
 		return ret;
+	}
+	devres_remove_group(appledwc->dev, group);
 
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 	return 0;
@@ -238,15 +252,18 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	 */
 	switch (state) {
 	case DWC3_APPLE_HOST:
-		phy_set_mode(appledwc->dwc.usb2_generic_phy[0], PHY_MODE_USB_HOST);
+		ret = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_HOST);
 		break;
 	case DWC3_APPLE_DEVICE:
-		phy_set_mode(appledwc->dwc.usb2_generic_phy[0], PHY_MODE_USB_DEVICE);
+		ret = phy_set_mode(appledwc->usb2_phy, PHY_MODE_USB_DEVICE);
 		break;
 	default:
 		/* Unreachable unless there's a bug in this driver */
 		return -EINVAL;
 	}
+
+	if (ret)
+		return ret;
 
 	ret = reset_control_deassert(appledwc->reset);
 	if (ret) {
@@ -449,10 +466,18 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	appledwc->dev = &pdev->dev;
+	appledwc->dwc.dev = dev;
+	platform_set_drvdata(pdev, &appledwc->dwc);
 	appledwc->hw = device_get_match_data(dev);
 	if (!appledwc->hw)
 		return -EINVAL;
 	mutex_init(&appledwc->lock);
+
+	/* The core acquires its PHYs too late for the first role's mode setup. */
+	appledwc->usb2_phy = devm_phy_optional_get(dev, "usb2-phy");
+	if (IS_ERR(appledwc->usb2_phy))
+		return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
+				     "Failed to get USB2 PHY\n");
 
 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
 	if (IS_ERR(appledwc->reset))
