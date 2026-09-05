@@ -27,6 +27,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/sysfs.h>
 
 #define MAX_LABEL_LENGTH	32
 
@@ -86,6 +87,48 @@ struct macsmc_hwmon {
 	struct macsmc_hwmon_sensors curr;
 	struct macsmc_hwmon_sensors power;
 	struct macsmc_hwmon_fans fan;
+	struct macsmc_hwmon_sensor pressure;
+	bool register_thermal_zones;
+};
+
+static ssize_t thermal_pressure_level_show(struct device *dev,
+					   struct device_attribute *attr,
+					   char *buf)
+{
+	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+	s32 val;
+	int ret;
+
+	ret = apple_smc_read_s32(hwmon->smc, hwmon->pressure.macsmc_key, &val);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "%d\n", val);
+}
+static DEVICE_ATTR_RO(thermal_pressure_level);
+
+static umode_t macsmc_hwmon_extra_is_visible(struct kobject *kobj,
+					     struct attribute *attr, int index)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
+
+	return hwmon->pressure.macsmc_key ? 0444 : 0;
+}
+
+static struct attribute *macsmc_hwmon_extra_attrs[] = {
+	&dev_attr_thermal_pressure_level.attr,
+	NULL,
+};
+
+static const struct attribute_group macsmc_hwmon_extra_group = {
+	.attrs = macsmc_hwmon_extra_attrs,
+	.is_visible = macsmc_hwmon_extra_is_visible,
+};
+
+static const struct attribute_group *macsmc_hwmon_extra_groups[] = {
+	&macsmc_hwmon_extra_group,
+	NULL,
 };
 
 static int macsmc_hwmon_read_label(struct device *dev,
@@ -481,12 +524,67 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	if (ret)
 		return ret;
 
+	if (!(sensor->info.flags & APPLE_SMC_READABLE))
+		return -EACCES;
+
+	switch (sensor->info.type_code) {
+	case __SMC_KEY('f', 'l', 't', ' '):
+		if (sensor->info.size != sizeof(u32))
+			return -EINVAL;
+		break;
+	case __SMC_KEY('i', 'o', 'f', 't'):
+		if (sensor->info.size != sizeof(u64))
+			return -EINVAL;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
 	ret = of_property_read_string(sensor_node, "label", &label);
 	if (ret)
 		dev_dbg(dev, "No label found for sensor %s\n", key);
 	else
 		strscpy_pad(sensor->label, label, sizeof(sensor->label));
 
+	return 0;
+}
+
+static int macsmc_hwmon_create_pressure(struct macsmc_hwmon *hwmon,
+					struct device_node *hwmon_node)
+{
+	struct macsmc_hwmon_sensor pressure = {};
+	const char *key;
+	s32 val;
+	int ret;
+
+	ret = of_property_read_string(hwmon_node, "apple,thermal-pressure-key",
+				      &key);
+	if (ret == -EINVAL)
+		return 0;
+	if (ret)
+		return ret;
+
+	ret = macsmc_hwmon_parse_key(hwmon->dev, hwmon->smc, &pressure, key);
+	if (ret)
+		goto invalid;
+
+	if (pressure.info.size != sizeof(s32) ||
+	    pressure.info.type_code != __SMC_KEY('s', 'i', '3', '2') ||
+	    !(pressure.info.flags & APPLE_SMC_READABLE)) {
+		ret = -EINVAL;
+		goto invalid;
+	}
+
+	ret = apple_smc_read_s32(hwmon->smc, pressure.macsmc_key, &val);
+	if (ret)
+		goto invalid;
+
+	hwmon->pressure = pressure;
+	return 0;
+
+invalid:
+	dev_warn(hwmon->dev, "Ignoring invalid thermal pressure key %s (%d)\n",
+		 key, ret);
 	return 0;
 }
 
@@ -699,6 +797,8 @@ static void macsmc_hwmon_populate_fan_configs(u32 *configs, const struct macsmc_
 
 static const struct hwmon_channel_info *const macsmc_chip_channel_info =
 	HWMON_CHANNEL_INFO(chip, HWMON_C_REGISTER_TZ);
+static const struct hwmon_channel_info *const macsmc_chip_channel_info_no_tz =
+	HWMON_CHANNEL_INFO(chip, 0);
 
 static int macsmc_hwmon_create_infos(struct macsmc_hwmon *hwmon)
 {
@@ -706,7 +806,8 @@ static int macsmc_hwmon_create_infos(struct macsmc_hwmon *hwmon)
 	int i = 0;
 
 	/* chip */
-	hwmon->channel_infos[i++] = macsmc_chip_channel_info;
+	hwmon->channel_infos[i++] = hwmon->register_thermal_zones ?
+		macsmc_chip_channel_info : macsmc_chip_channel_info_no_tz;
 
 	if (hwmon->curr.count) {
 		channel_info = &hwmon->curr.channel_info;
@@ -792,6 +893,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 
 	hwmon->dev = &pdev->dev;
 	hwmon->smc = smc;
+	hwmon->register_thermal_zones = !of_machine_is_compatible("apple,j713");
 
 	ret = macsmc_hwmon_populate_sensors(hwmon, hwmon->dev->of_node);
 	if (ret) {
@@ -799,9 +901,13 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = macsmc_hwmon_create_pressure(hwmon, hwmon->dev->of_node);
+	if (ret)
+		return ret;
+
 	if (!hwmon->curr.count && !hwmon->fan.count &&
 	    !hwmon->power.count && !hwmon->temp.count &&
-	    !hwmon->volt.count) {
+	    !hwmon->volt.count && !hwmon->pressure.macsmc_key) {
 		dev_err(hwmon->dev,
 			"No valid sensors found of any supported type\n");
 		return -ENODEV;
@@ -817,7 +923,8 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 
 	hwmon->hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
 								"macsmc_hwmon", hwmon,
-								&hwmon->chip_info, NULL);
+								&hwmon->chip_info,
+								macsmc_hwmon_extra_groups);
 	if (IS_ERR(hwmon->hwmon_dev))
 		return dev_err_probe(hwmon->dev, PTR_ERR(hwmon->hwmon_dev),
 				     "Probing SMC hwmon device failed\n");
