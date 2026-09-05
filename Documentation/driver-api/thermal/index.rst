@@ -12,6 +12,8 @@ Thermal
    sysfs-api
    power_allocator
 
+   apple-pmp
+
    exynos_thermal
    exynos_thermal_emulation
    nouveau_thermal

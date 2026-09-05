@@ -17,6 +17,21 @@ menuconfig THERMAL
 
 if THERMAL
 
+config APPLE_PMP_THERMAL
+	tristate "Apple PMP hotspot CPU thermal policy"
+	depends on ARCH_APPLE && APPLE_PMP_REPORT && CPU_FREQ
+	select CPU_THERMAL
+	select THERMAL_GOV_STEP_WISE
+	help
+	  Register a PMP die-hotspot thermal zone and cpufreq cooling devices
+	  on the validated J713/T8132 board. Start passive cooling at 70 C
+	  toward an approximately 80 C operating target, using read-only PMP
+	  telemetry. These are Linux policy choices, not Apple safety limits.
+	  Sensor errors clamp both clusters to their lowest frequencies.
+	  The module can be loaded without restarting PMP. Unloading it removes
+	  this thermal policy, so do not unload while running a stress test.
+	  If built as a module, it is named apple-pmp-thermal.
+
 config THERMAL_NETLINK
 	bool "Thermal netlink management"
 	depends on NET
