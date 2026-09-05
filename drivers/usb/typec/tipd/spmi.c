@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
 #include <linux/regmap.h>
@@ -9,6 +10,29 @@
 #include "tps6598x.h"
 
 #define tps_to_sn(tps) container_of_const((tps), struct sn201202x, cd.tps)
+
+struct sn201202x_match_data {
+	const struct tipd_data *tipd;
+	bool select_irq_optional;
+};
+
+static int sn201202x_poll_select(struct spmi_device *sdev, u8 reg)
+{
+	int err, ret;
+	u8 val;
+
+	ret = read_poll_timeout(spmi_register_read, err,
+				err || val != (reg | BIT(7)), 1000, 100000,
+				false, sdev, 0, &val);
+	if (ret)
+		return ret;
+	if (err)
+		return err;
+	if (val != reg)
+		return -EIO;
+
+	return 0;
+}
 
 static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 {
@@ -19,10 +43,14 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	struct tps6598x *tps = spmi_device_get_drvdata(sdev);
 	struct sn201202x *sn = tps_to_sn(tps);
 
-	reinit_completion(&sn->select_completion);
+	if (sn->has_select_irq)
+		reinit_completion(&sn->select_completion);
 	err = spmi_register_zero_write(sdev, reg);
 	if (err)
 		return err;
+
+	if (!sn->has_select_irq)
+		return sn201202x_poll_select(sdev, reg);
 
 	if (!wait_for_completion_timeout(&sn->select_completion, msecs_to_jiffies(100)))
 		return -ETIMEDOUT;
@@ -152,14 +180,25 @@ static struct regmap *__devm_regmap_init_sn201202x(struct spmi_device *sdev,
 	__regmap_lockdep_wrapper(__devm_regmap_init_sn201202x, #config,	\
 				dev, config)
 
+static const struct sn201202x_match_data sn201202x_data = {
+	.tipd = &tipd_sn201202x_data,
+};
+
+static const struct sn201202x_match_data sn201202x_t8132_data = {
+	.tipd = &tipd_sn201202x_data,
+	.select_irq_optional = true,
+};
+
 static const struct of_device_id sn201202x_of_match[] = {
-	{ .compatible = "apple,sn201202x", &tipd_sn201202x_data},
+	{ .compatible = "apple,t8132-sn201202x", .data = &sn201202x_t8132_data },
+	{ .compatible = "apple,sn201202x", .data = &sn201202x_data },
 	{}
 };
 
 static int sn201202x_probe(struct spmi_device *device)
 {
 	const struct of_device_id *match;
+	const struct sn201202x_match_data *match_data;
 	const struct tipd_data *data;
 	struct sn201202x *sn;
 	struct tps6598x *tps;
@@ -169,7 +208,8 @@ static int sn201202x_probe(struct spmi_device *device)
 	match = of_match_device(sn201202x_of_match, &device->dev);
 	if (!match)
 		return -EINVAL;
-	data = match->data;
+	match_data = match->data;
+	data = match_data->tipd;
 
 	sn = devm_kzalloc(&device->dev, data->tps_struct_size, GFP_KERNEL);
 	if (!sn)
@@ -185,7 +225,11 @@ static int sn201202x_probe(struct spmi_device *device)
 	if (tps->irq < 0)
 		return tps->irq;
 	irq_select = of_irq_get_byname(device->dev.of_node, "select");
-	if (irq_select < 0)
+	if (irq_select == -EPROBE_DEFER)
+		return irq_select;
+	if (irq_select < 0 &&
+	    (!match_data->select_irq_optional ||
+	     (irq_select != -EINVAL && irq_select != -ENODATA)))
 		return irq_select;
 	irq_sleep = of_irq_get_byname(device->dev.of_node, "sleep");
 	if (irq_sleep < 0)
@@ -198,10 +242,13 @@ static int sn201202x_probe(struct spmi_device *device)
 	init_completion(&sn->sleep_completion);
 	init_completion(&sn->wake_completion);
 
-	ret = devm_request_irq(&device->dev, irq_select, sn201202x_irq,
-			       0, NULL, &sn->select_completion);
-	if (ret)
-		return ret;
+	if (irq_select >= 0) {
+		ret = devm_request_irq(&device->dev, irq_select, sn201202x_irq,
+				       0, NULL, &sn->select_completion);
+		if (ret)
+			return ret;
+		sn->has_select_irq = true;
+	}
 	ret = devm_request_irq(&device->dev, irq_sleep, sn201202x_irq,
 			       0, NULL, &sn->sleep_completion);
 	if (ret)

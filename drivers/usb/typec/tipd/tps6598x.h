@@ -380,6 +380,7 @@ struct sn201202x {
 	struct completion sleep_completion;
 	struct completion wake_completion;
 	struct spmi_device *sdev;
+	bool has_select_irq;
 };
 
 extern const struct tipd_data tipd_cd321x_data;
