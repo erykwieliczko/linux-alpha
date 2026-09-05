@@ -31,6 +31,7 @@ properties:
               - apple,t8103-asc-mailbox
               - apple,t8112-asc-mailbox
               - apple,t8122-asc-mailbox
+              - apple,t8132-asc-mailbox
               - apple,t6000-asc-mailbox
               - apple,t6020-asc-mailbox
           - const: apple,asc-mailbox-v4
@@ -74,7 +75,20 @@ properties:
     const: 0
 
   power-domains:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8132-asc-mailbox
+    then:
+      properties:
+        power-domains:
+          maxItems: 1
 
 required:
   - compatible
