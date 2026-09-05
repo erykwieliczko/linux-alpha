@@ -139,7 +139,7 @@ static int apple_wdt_restart(struct watchdog_device *wdd, unsigned long mode,
 	return 0;
 }
 
-static struct watchdog_ops apple_wdt_ops = {
+static const struct watchdog_ops apple_wdt_ops = {
 	.owner = THIS_MODULE,
 	.start = apple_wdt_start,
 	.stop = apple_wdt_stop,
@@ -147,6 +147,15 @@ static struct watchdog_ops apple_wdt_ops = {
 	.set_timeout = apple_wdt_set_timeout,
 	.get_timeleft = apple_wdt_get_timeleft,
 	.restart = apple_wdt_restart,
+};
+
+static const struct watchdog_ops apple_wdt_no_restart_ops = {
+	.owner = THIS_MODULE,
+	.start = apple_wdt_start,
+	.stop = apple_wdt_stop,
+	.ping = apple_wdt_ping,
+	.set_timeout = apple_wdt_set_timeout,
+	.get_timeleft = apple_wdt_get_timeleft,
 };
 
 static struct watchdog_info apple_wdt_info = {
@@ -178,7 +187,10 @@ static int apple_wdt_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, wdt);
 
-	wdt->wdd.ops = &apple_wdt_ops;
+	if (of_machine_is_compatible("apple,j713"))
+		wdt->wdd.ops = &apple_wdt_no_restart_ops;
+	else
+		wdt->wdd.ops = &apple_wdt_ops;
 	wdt->wdd.info = &apple_wdt_info;
 	wdt->wdd.max_hw_heartbeat_ms = U32_MAX / wdt->clk_rate * 1000;
 	wdt->wdd.timeout = APPLE_WDT_TIMEOUT_DEFAULT;
@@ -190,7 +202,8 @@ static int apple_wdt_probe(struct platform_device *pdev)
 	watchdog_init_timeout(&wdt->wdd, 0, dev);
 	apple_wdt_set_timeout(&wdt->wdd, wdt->wdd.timeout);
 	watchdog_stop_on_unregister(&wdt->wdd);
-	watchdog_set_restart_priority(&wdt->wdd, 128);
+	if (wdt->wdd.ops->restart)
+		watchdog_set_restart_priority(&wdt->wdd, 128);
 
 	return devm_watchdog_register_device(dev, &wdt->wdd);
 }
