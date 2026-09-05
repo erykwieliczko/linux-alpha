@@ -15,27 +15,59 @@ description: |
   A variant of tps6598x controller also known as Apple ACE3
   present on hardware with Apple SoCs starting from the M3.
 
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sn201202x
+    then:
+      properties:
+        interrupts:
+          maxItems: 3
+        interrupt-names:
+          maxItems: 3
+    else:
+      properties:
+        interrupts:
+          minItems: 4
+        interrupt-names:
+          minItems: 4
+
 properties:
   compatible:
-    enum:
-      - apple,sn201202x
+    oneOf:
+      - items:
+          - const: apple,t8132-sn201202x
+          - const: apple,sn201202x
+      - const: apple,sn201202x
 
   reg:
     maxItems: 1
 
   interrupts:
-    items:
-      - description: Primary irq used for tps6598x events
-      - description: Logical register selection completed
-      - description: Standby command completed
-      - description: Wakeup command completed
+    oneOf:
+      - items:
+          - description: Primary IRQ used for TPS6598x events
+          - description: Logical register selection completed
+          - description: Standby command completed
+          - description: Wakeup command completed
+      - items:
+          - description: Primary IRQ used for TPS6598x events
+          - description: Standby command completed
+          - description: Wakeup command completed
 
   interrupt-names:
-    items:
-      - const: irq
-      - const: select
-      - const: sleep
-      - const: wake
+    oneOf:
+      - items:
+          - const: irq
+          - const: select
+          - const: sleep
+          - const: wake
+      - items:
+          - const: irq
+          - const: sleep
+          - const: wake
 
   connector:
     $ref: /schemas/connector/usb-connector.yaml#
