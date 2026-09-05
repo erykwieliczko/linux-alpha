@@ -56,6 +56,8 @@ const OPC_FREE: u64 = 0x14;
 const OPC_SET_BUF: u64 = 0x30;
 const OPC_REGISTER_IOREG: u64 = 0x32;
 const OPC_SET_IOREG: u64 = 0x34;
+const OPC_UPDATE_IOREG: u64 = 0x36;
+const OPC_CONFIRM_IOREG: u64 = 0x37;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
 const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
@@ -354,6 +356,9 @@ impl PmpData {
             OPC_SET_BUF => self.set_buf(msg & MSG_IOVA_MASK)?,
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
+            // Firmware waits for this confirmation before publishing reports.
+            // Do not echo the registry index/payload or add a generic ACK bit.
+            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
@@ -437,6 +442,7 @@ impl platform::Driver for PmpDriver {
         *data.rtkit.lock() = Some(rtkit);
         data.start_cpu(pdev)?;
         data.start()?;
+        dev_info!(dev, "PMP firmware and endpoint ready");
         Ok(PmpDriver(data))
     }
 }
