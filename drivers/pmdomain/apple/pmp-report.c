@@ -5,6 +5,7 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/hwmon.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -12,6 +13,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/soc/apple/pmp-temps.h>
 
 #define PMP_REPORT_READY 0x1
 
@@ -26,8 +28,86 @@ struct apple_pmp_report {
 	struct device *dev;
 	const struct apple_pmp_report_offsets *offsets;
 	void __iomem *base;
+	void __iomem *temp_sram;
 	spinlock_t lock;
 };
+
+
+static umode_t apple_pmp_temp_is_visible(const void *data,
+					 enum hwmon_sensor_types type, u32 attr,
+					 int channel)
+{
+	if (channel < 0 || channel >= PMP_TEMP_CHANNELS || type != hwmon_temp)
+		return 0;
+	if (attr == hwmon_temp_input || attr == hwmon_temp_label)
+		return 0444;
+	return 0;
+}
+
+static int apple_pmp_temp_read(struct device *dev, enum hwmon_sensor_types type,
+			       u32 attr, int channel, long *value)
+{
+	struct apple_pmp_report *rep = dev_get_drvdata(dev);
+
+	if (channel < 0 || channel >= PMP_TEMP_CHANNELS)
+		return -EINVAL;
+	if (type != hwmon_temp || attr != hwmon_temp_input)
+		return -EOPNOTSUPP;
+	if (!channel)
+		return apple_pmp_temp_hotspot(rep->temp_sram, value);
+	return apple_pmp_temp_sample(rep->temp_sram, channel - 1, value);
+}
+
+static int apple_pmp_temp_read_string(struct device *dev, enum hwmon_sensor_types type,
+				      u32 attr, int channel, const char **str)
+{
+	if (channel < 0 || channel >= PMP_TEMP_CHANNELS)
+		return -EINVAL;
+	if (type != hwmon_temp || attr != hwmon_temp_label)
+		return -EOPNOTSUPP;
+
+	*str = channel ? apple_pmp_temp_records[channel - 1].label :
+			 "PMP aggregate die hotspot";
+	return 0;
+}
+
+static const struct hwmon_ops apple_pmp_temp_ops = {
+	.is_visible = apple_pmp_temp_is_visible,
+	.read = apple_pmp_temp_read,
+	.read_string = apple_pmp_temp_read_string,
+};
+
+static const struct hwmon_channel_info * const apple_pmp_temp_info[] = {
+	HWMON_CHANNEL_INFO(temp,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL,
+			   HWMON_T_INPUT | HWMON_T_LABEL),
+	NULL,
+};
+
+static const struct hwmon_chip_info apple_pmp_temp_chip = {
+	.ops = &apple_pmp_temp_ops,
+	.info = apple_pmp_temp_info,
+};
+
+static int apple_pmp_temp_register(struct apple_pmp_report *rep)
+{
+	struct device *hwmon;
+
+	/* Read-only telemetry from running firmware; never start or stop PMP. */
+	rep->temp_sram = devm_ioremap(rep->dev, PMP_TEMP_SRAM_BASE, PMP_TEMP_SRAM_SIZE);
+	if (!rep->temp_sram)
+		return dev_err_probe(rep->dev, -ENOMEM, "cannot map PMP temperature SRAM\n");
+
+	hwmon = devm_hwmon_device_register_with_info(rep->dev, "apple_pmp", rep,
+						     &apple_pmp_temp_chip, NULL);
+	if (IS_ERR(hwmon))
+		return dev_err_probe(rep->dev, PTR_ERR(hwmon), "cannot register PMP hwmon\n");
+	return 0;
+}
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
@@ -46,6 +126,11 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
 	dev_set_drvdata(dev, rep);
+	if (of_device_is_compatible(np, "apple,t8132-pmp-v2-report")) {
+		ret = apple_pmp_temp_register(rep);
+		if (ret)
+			return ret;
+	}
 	ret = of_platform_populate(np, NULL, NULL, dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to create child devices\n");
@@ -74,10 +159,18 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.status = 0x10,
 };
 
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
+	.tgt_read = 0x1880,
+	.tgt_write = 0x10c40,
+	.actual = 0x1900,
+	.status = 0x10,
+};
+
 static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
+	{ .compatible = "apple,t8132-pmp-v2-report", .data = &apple_pmp_offsets_t8132 },
 	{}
 };
 
