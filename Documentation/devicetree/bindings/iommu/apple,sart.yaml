@@ -31,6 +31,7 @@ properties:
     oneOf:
       - items:
           - enum:
+              - apple,t8132-sart
               - apple,t6020-sart
               - apple,t8112-sart
               - apple,t8122-sart
