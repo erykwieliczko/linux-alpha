@@ -24,6 +24,7 @@ properties:
               - apple,t6031-pinctrl
               - apple,t8122-pinctrl
               - apple,t8132-pinctrl
+              - apple,t8140-pinctrl
           - const: apple,t8103-pinctrl
       - items:
           # Do not add additional SoC to this list.
@@ -52,9 +53,17 @@ properties:
   gpio-ranges:
     maxItems: 1
 
+  gpio-reserved-ranges: true
+
   apple,npins:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: The number of pins in this GPIO controller.
+
+  apple,no-regcache:
+    type: boolean
+    description: >
+      Read pin state directly rather than prefetching all pin registers into
+      a cache. Required when firmware retains ownership of inaccessible pins.
 
   interrupts:
     description: One interrupt for each of the (up to 7) interrupt

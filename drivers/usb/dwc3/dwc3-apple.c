@@ -77,6 +77,7 @@ enum dwc3_apple_state {
 
 struct dwc3_apple_hw {
 	bool has_cio;
+	bool fixed_usb2_host;
 };
 
 /**
@@ -102,6 +103,9 @@ struct dwc3_apple {
 	struct phy *usb2_phy;
 	struct reset_control *reset;
 	struct usb_role_switch *role_sw;
+	bool fixed_usb2_host;
+	enum usb_role input_role;
+	int input_sync_error;
 
 	struct mutex lock;
 
@@ -292,7 +296,9 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 		 * has already been configured to the correct mode earlier.
 		 */
 		dwc3_enable_susphy(&appledwc->dwc, true);
-		phy_set_mode(appledwc->dwc.usb3_generic_phy[0], PHY_MODE_USB_HOST);
+		ret = phy_set_mode(appledwc->dwc.usb3_generic_phy[0], PHY_MODE_USB_HOST);
+		if (ret && appledwc->fixed_usb2_host)
+			goto core_exit;
 		ret = dwc3_host_init(&appledwc->dwc);
 		if (ret) {
 			dev_err(appledwc->dev, "Failed to initialize host, ret=%d\n", ret);
@@ -379,6 +385,31 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	int ret;
 
 	guard(mutex)(&appledwc->lock);
+	if (appledwc->fixed_usb2_host) {
+		enum usb_role old = appledwc->input_role;
+
+		if (role != USB_ROLE_NONE && role != USB_ROLE_HOST && role != USB_ROLE_DEVICE)
+			return -EINVAL;
+		if (appledwc->state != DWC3_APPLE_HOST)
+			return -EAGAIN;
+		appledwc->input_role = role;
+		if (old != role)
+			dev_info(appledwc->dev, "J700 front input 1 role %u -> %u\n", old, role);
+		if (role == USB_ROLE_NONE)
+			appledwc->input_sync_error = 0;
+		if (old == USB_ROLE_NONE && role == USB_ROLE_HOST) {
+			appledwc->input_sync_error = phy_reset(appledwc->usb2_phy);
+			if (appledwc->input_sync_error)
+				dev_err(appledwc->dev, "Front attachment synchronization failed: %d\n",
+					appledwc->input_sync_error);
+			else
+				dev_info(appledwc->dev, "J700 front attachment synchronized\n");
+		}
+		/* Keep the shared hub alive even when this input disconnects.
+		 * A failed synchronization is reported, not retried on HOST->HOST.
+		 */
+		return appledwc->input_sync_error;
+	}
 
 	/*
 	 * Skip role switches if appledwc is already in the desired state. The
@@ -424,6 +455,8 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
 	struct dwc3_apple *appledwc = usb_role_switch_get_drvdata(sw);
 
 	guard(mutex)(&appledwc->lock);
+	if (appledwc->fixed_usb2_host)
+		return appledwc->input_role;
 
 	switch (appledwc->state) {
 	case DWC3_APPLE_HOST:
@@ -443,12 +476,29 @@ static enum usb_role dwc3_usb_role_switch_get(struct usb_role_switch *sw)
 static int dwc3_apple_setup_role_switch(struct dwc3_apple *appledwc)
 {
 	struct usb_role_switch_desc dwc3_role_switch = { NULL };
+	struct device_node *inputs, *input = NULL;
+	u32 index;
 
 	dwc3_role_switch.fwnode = dev_fwnode(appledwc->dev);
+	if (appledwc->fixed_usb2_host) {
+		inputs = of_get_child_by_name(appledwc->dev->of_node, "usb2-role-inputs");
+		if (!inputs)
+			return 0; /* Explicit HPM-unbound diagnostic profile. */
+		if (of_get_available_child_count(inputs) == 1)
+			input = of_get_next_available_child(inputs, NULL);
+		of_node_put(inputs);
+		/* First-light owns only front input 1, never the rear debug input. */
+		if (!input || of_property_read_u32(input, "reg", &index) || index != 1) {
+			of_node_put(input);
+			return -EINVAL;
+		}
+		dwc3_role_switch.fwnode = of_fwnode_handle(input);
+	}
 	dwc3_role_switch.set = dwc3_usb_role_switch_set;
 	dwc3_role_switch.get = dwc3_usb_role_switch_get;
 	dwc3_role_switch.driver_data = appledwc;
 	appledwc->role_sw = usb_role_switch_register(appledwc->dev, &dwc3_role_switch);
+	of_node_put(input);
 	if (IS_ERR(appledwc->role_sw))
 		return PTR_ERR(appledwc->role_sw);
 
@@ -471,6 +521,8 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->hw = device_get_match_data(dev);
 	if (!appledwc->hw)
 		return -EINVAL;
+	appledwc->fixed_usb2_host = appledwc->hw->fixed_usb2_host &&
+		device_property_read_bool(dev, "apple,usb2-fixed-host");
 	mutex_init(&appledwc->lock);
 
 	/* The core acquires its PHYs too late for the first role's mode setup. */
@@ -509,6 +561,24 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 * details.
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
+	if (appledwc->fixed_usb2_host) {
+		/* The shared onboard hub is present independently of Type-C events. */
+		guard(mutex)(&appledwc->lock);
+
+		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
+		if (ret && appledwc->state != DWC3_APPLE_PROBE_PENDING)
+			dwc3_core_remove(&appledwc->dwc);
+		if (ret)
+			return dev_err_probe(dev, ret, "Fixed USB2 host initialization failed\n");
+		ret = dwc3_apple_setup_role_switch(appledwc);
+		if (ret) {
+			dwc3_apple_exit(appledwc);
+			dwc3_core_remove(&appledwc->dwc);
+			return dev_err_probe(dev, ret, "Front role input registration failed\n");
+		}
+		dev_info(dev, "J700 shared USB2 host started\n");
+		return 0;
+	}
 	ret = dwc3_apple_setup_role_switch(appledwc);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
@@ -541,7 +611,13 @@ static const struct dwc3_apple_hw dwc3_apple_hw_full = {
 
 static const struct dwc3_apple_hw dwc3_apple_hw_t8132 = {};
 
+static const struct dwc3_apple_hw dwc3_apple_hw_t8140 = {
+	.has_cio = true,
+	.fixed_usb2_host = true,
+};
+
 static const struct of_device_id dwc3_apple_of_match[] = {
+	{ .compatible = "apple,t8140-dwc3", .data = &dwc3_apple_hw_t8140 },
 	{ .compatible = "apple,t8132-dwc3", .data = &dwc3_apple_hw_t8132 },
 	{ .compatible = "apple,t8103-dwc3", .data = &dwc3_apple_hw_full },
 	{}

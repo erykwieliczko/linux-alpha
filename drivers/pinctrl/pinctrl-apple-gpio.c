@@ -433,6 +433,7 @@ out_free_irq_data:
 
 static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 {
+	struct regmap_config config = regmap_config;
 	struct apple_gpio_pinctrl *pctl;
 	struct pinctrl_pin_desc *pins;
 	unsigned int npins;
@@ -475,7 +476,12 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(pctl->base))
 		return PTR_ERR(pctl->base);
 
-	pctl->map = devm_regmap_init_mmio(&pdev->dev, pctl->base, &regmap_config);
+	/* Some platforms retain firmware-owned pins that must not be prefetched. */
+	if (of_property_read_bool(pdev->dev.of_node, "apple,no-regcache")) {
+		config.cache_type = REGCACHE_NONE;
+		config.num_reg_defaults_raw = 0;
+	}
+	pctl->map = devm_regmap_init_mmio(&pdev->dev, pctl->base, &config);
 	if (IS_ERR(pctl->map))
 		return dev_err_probe(&pdev->dev, PTR_ERR(pctl->map),
 				     "Failed to create regmap\n");

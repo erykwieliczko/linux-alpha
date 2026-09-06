@@ -16,6 +16,24 @@ description:
 allOf:
   - $ref: snps,dwc3-common.yaml#
   - if:
+      required:
+        - apple,usb2-fixed-host
+    then:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-dwc3
+        dr_mode:
+          const: host
+        maximum-speed:
+          const: high-speed
+      required:
+        - dr_mode
+        - maximum-speed
+    else:
+      required:
+        - usb-role-switch
+  - if:
       not:
         properties:
           compatible:
@@ -33,6 +51,7 @@ properties:
               - apple,t6000-dwc3
               - apple,t6020-dwc3
               - apple,t8112-dwc3
+              - apple,t8140-dwc3
           - const: apple,t8103-dwc3
       - enum:
           - apple,t8103-dwc3
@@ -60,6 +79,41 @@ properties:
   power-domains:
     maxItems: 1
 
+  apple,usb2-fixed-host:
+    type: boolean
+    description: >
+      Start the J700 shared onboard USB2 hub in host mode at probe, independently
+      of Type-C events. PHY and repeater readiness remain required dependencies.
+
+  usb2-role-inputs:
+    type: object
+    description: >
+      Optional front-only J700 attachment input. Index 1 identifies the front
+      connector; the rear debug connector has no protocol owner in this profile.
+    properties:
+      '#address-cells':
+        const: 1
+      '#size-cells':
+        const: 0
+      role-switch@1:
+        type: object
+        properties:
+          reg:
+            const: 1
+          usb-role-switch: true
+          port:
+            $ref: /schemas/graph.yaml#/properties/port
+        required:
+          - reg
+          - usb-role-switch
+          - port
+        additionalProperties: false
+    required:
+      - '#address-cells'
+      - '#size-cells'
+      - role-switch@1
+    additionalProperties: false
+
 required:
   - compatible
   - reg
@@ -67,7 +121,6 @@ required:
   - interrupts
   - iommus
   - resets
-  - usb-role-switch
 
 unevaluatedProperties: false
 

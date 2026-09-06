@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,j700-usb2-repeater.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J700 USB2 repeater and fixed hub supplier
+
+maintainers:
+  - Eryk Wieliczko <eryk@wieliczko.ninja>
+
+description: >
+  J700 places a TICD2E22 repeater before a shared VL122 USB2 hub. This board
+  supplier configures the repeater over byte-data I2C and owns GPIO142 for
+  the shared hub lifetime. It must be initialized before the SoC USB2 PHY
+  starts. It does not control Type-C attachment, VBUS, or debug routing.
+  The initial retained-power profile holds the GPIO physically low without
+  a reset pulse; suspend/resume and cold-start policy are not described here.
+
+properties:
+  compatible:
+    const: apple,j700-usb2-repeater
+
+  reg:
+    maxItems: 1
+
+  '#phy-cells':
+    const: 0
+
+  hub-hold-gpios:
+    maxItems: 1
+    description: Shared hub output, active-high descriptor held logically low.
+
+required:
+  - compatible
+  - reg
+  - '#phy-cells'
+  - hub-hold-gpios
+
+additionalProperties: false

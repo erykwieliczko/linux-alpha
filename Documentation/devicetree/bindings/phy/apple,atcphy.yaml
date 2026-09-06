@@ -32,6 +32,35 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,t8130-atcphy
+    then:
+      required:
+        - apple,usb2-fixed-host
+        - apple,tunable-usb2phy-reg-dflt
+        - phys
+        - phy-names
+      properties:
+        reg:
+          minItems: 6
+        reg-names:
+          minItems: 6
+        mode-switch: false
+        orientation-switch: false
+        ports: false
+    else:
+      required:
+        - orientation-switch
+        - mode-switch
+        - ports
+      properties:
+        apple,usb2-fixed-host: false
+        apple,tunable-usb2phy-reg-dflt: false
+        phys: false
+        phy-names: false
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,t8132-atcphy
     then:
       properties:
@@ -68,6 +97,9 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8130-atcphy
+          - const: apple,t8122-atcphy
+      - items:
           - enum:
               - apple,t6000-atcphy
               - apple,t6020-atcphy
@@ -79,6 +111,13 @@ properties:
 
   reg:
     oneOf:
+      - items:
+          - description: Common controls
+          - description: DisplayPort transmitter window
+          - description: AXI to Apple Fabric controls
+          - description: USB2 PHY controls
+          - description: PIPE interface controls
+          - description: Secondary eUSB2 calibration bank
       - items:
           - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
           - description: DisplayPort Alternate Mode PHY specific controls
@@ -97,6 +136,13 @@ properties:
           - const: axi2af
           - const: usb2phy
           - const: pipehandler
+          - const: usb2phy-reg
+      - items:
+          - const: core
+          - const: lpdptx
+          - const: axi2af
+          - const: usb2phy
+          - const: pipehandler
       - items:
           - const: usb2phy
           - const: pipehandler
@@ -109,6 +155,23 @@ properties:
 
   mode-switch: true
   orientation-switch: true
+
+  apple,usb2-fixed-host:
+    type: boolean
+    description: >
+      Shared fixed-hub USB2 host profile. Initialize the external repeater
+      before enabling the SoC PHY, and keep both SuperSpeed lanes disabled.
+      This profile does not provide Type-C mux or orientation switching.
+
+  apple,tunable-usb2phy-reg-dflt:
+    $ref: "#/$defs/apple,tunable"
+    description: Calibration applied to the secondary eUSB2 bank after RUN.
+
+  phys:
+    maxItems: 1
+
+  phy-names:
+    const: usb2-repeater
 
   power-domains:
     maxItems: 1
@@ -186,9 +249,6 @@ required:
   - reg-names
   - "#phy-cells"
   - "#reset-cells"
-  - orientation-switch
-  - mode-switch
-  - ports
 
 additionalProperties: false
 

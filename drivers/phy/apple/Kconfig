@@ -12,6 +12,16 @@ config PHY_APPLE_ATC
 
 	  If M is selected the module will be called 'phy-apple-atc'.
 
+config PHY_APPLE_J700_REPEATER
+	tristate "Apple J700 USB2 repeater supplier"
+	depends on I2C && GPIOLIB && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	select GENERIC_PHY
+	help
+	  Configure the J700 USB2 repeater before the SoC PHY starts. This
+	  retained-power first-light path holds the shared hub GPIO without
+	  pulsing reset and does not take over Type-C power policy.
+
 config PHY_APPLE_DPTX
 	tristate "Apple DPTX PHY"
 	depends on ARCH_APPLE || COMPILE_TEST
