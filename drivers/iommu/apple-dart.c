@@ -226,6 +226,7 @@ struct apple_dart {
 	u32 supports_bypass : 1;
 	u32 four_level : 1;
 	u32 locked : 1;
+	u32 retained_bypass;
 
 	dma_addr_t dma_min;
 	dma_addr_t dma_max;
@@ -837,6 +838,10 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	struct apple_dart_domain *dart_domain = to_dart_domain(domain);
 
 	for_each_stream_map(i, cfg, stream_map)
+		if (stream_map->dart->retained_bypass)
+			return -EBUSY;
+
+	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
@@ -905,6 +910,9 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 
 	if (cfg->locked)
 		return -EINVAL;
+	for_each_stream_map(i, cfg, stream_map)
+		if (stream_map->dart->retained_bypass)
+			return -EBUSY;
 
 	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
@@ -1004,6 +1012,8 @@ static int apple_dart_of_xlate(struct device *dev,
 	if (args->args_count != 1)
 		return -EINVAL;
 	sid = args->args[0];
+	if (dart->retained_bypass && sid != 0)
+		return -EINVAL;
 
 	if (!cfg) {
 		cfg = kzalloc_obj(*cfg);
@@ -1164,6 +1174,8 @@ static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
+	if (cfg->stream_maps[0].dart->retained_bypass)
+		return IOMMU_DOMAIN_IDENTITY;
 	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
@@ -1418,7 +1430,21 @@ static int apple_dart_probe(struct platform_device *pdev)
 	}
 
 	dart->locked = apple_dart_is_locked(dart);
-	if (!dart->locked) {
+	of_property_read_u32(dev->of_node, "linux-enablement-mac,retained-bypass",
+			     &dart->retained_bypass);
+	if (dart->retained_bypass) {
+		/* J700's live MTP uses SID 0 in bypass, with DAPF still active. */
+		if (!of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
+		    dart->retained_bypass != 1 || dart->locked || !dart->supports_bypass ||
+		    (readl(dart->regs + DART_TCR(dart, 0)) &
+		     (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_TRANSLATE_ENABLE)) !=
+		    DART_T8110_TCR_BYPASS_DART ||
+		    (readl(dart->regs + DART_TTBR(dart, 0, 0)) & dart->hw->ttbr_valid)) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dev_info(dev, "Preserving inherited SID 0 bypass for live MTP\n");
+	} else if (!dart->locked) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
@@ -1467,7 +1493,7 @@ static void apple_dart_remove(struct platform_device *pdev)
 {
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
-	if (!dart->locked)
+	if (!dart->locked && !dart->retained_bypass)
 		apple_dart_hw_reset(dart);
 
 	if (dart->irq >= 0)
@@ -1587,6 +1613,10 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
+
+	/* There is no firmware ownership transfer for this bring-up profile. */
+	if (dart->retained_bypass)
+		return -EBUSY;
 
 	/* Locked DARTs can't be restored so skip saving their registers. */
 	if (dart->locked)

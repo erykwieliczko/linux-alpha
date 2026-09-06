@@ -78,6 +78,8 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_rtkit_helper *helper;
+	const struct property *handoff;
+	u32 inherited;
 	int ret;
 
 	/* 44 bits for addresses in standard RTKit requests */
@@ -104,9 +106,15 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 					"Failed to map SRAM region");
 	}
 
-	helper->inherited =
-		of_property_read_bool(dev->of_node,
-				      "linux-enablement-mac,rtkit-inherited");
+	handoff = of_find_property(dev->of_node, "linux-enablement-mac,rtkit-inherited", NULL);
+	helper->inherited = handoff != NULL;
+	if (handoff && handoff->length) {
+		if (handoff->length != sizeof(inherited) ||
+		    of_property_read_u32(dev->of_node, handoff->name, &inherited) ||
+		    inherited > 1)
+			return dev_err_probe(dev, -EINVAL, "Invalid RTKit ownership flag\n");
+		helper->inherited = inherited == 1;
+	}
 	if (helper->inherited) {
 		/*
 		 * A previous boot stage explicitly transferred ownership of the

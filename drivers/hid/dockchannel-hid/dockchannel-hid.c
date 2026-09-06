@@ -1193,6 +1193,11 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	/* Neo firmware has no STM interface from which to obtain identity. */
+	if (of_property_read_bool(dev->of_node, "apple,no-stm")) {
+		dchid->device_id.vendor_id = HOST_VENDOR_ID_APPLE;
+		dchid->id_ready = true;
+	}
 
 	/*
 	 * First make sure all the GPIOs are available, in cased we need to defer.
