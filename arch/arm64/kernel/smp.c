@@ -65,7 +65,7 @@ struct secondary_data secondary_data;
 static int cpus_stuck_in_kernel;
 
 static int ipi_irq_base __ro_after_init;
-static int nr_ipi __ro_after_init = NR_IPI;
+static int nr_ipi __ro_after_init;
 
 struct ipi_descs {
 	struct irq_desc *descs[MAX_IPI];
@@ -832,7 +832,7 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 {
 	unsigned int cpu, i;
 
-	for (i = 0; i < MAX_IPI; i++) {
+	for (i = 0; i < nr_ipi; i++) {
 		seq_printf(p, "%*s%u:%s", prec - 1, "IPI", i,
 			   prec >= 4 ? " " : "");
 		for_each_online_cpu(cpu)
@@ -855,9 +855,16 @@ void arch_send_call_function_single_ipi(int cpu)
 }
 
 #ifdef CONFIG_IRQ_WORK
+bool arch_irq_work_has_interrupt(void)
+{
+	return nr_ipi > IPI_IRQ_WORK;
+}
+
 void arch_irq_work_raise(void)
 {
-	smp_cross_call(cpumask_of(smp_processor_id()), IPI_IRQ_WORK);
+	/* Single-CPU bring-up without an IPI provider uses irq_work_tick(). */
+	if (arch_irq_work_has_interrupt())
+		smp_cross_call(cpumask_of(smp_processor_id()), IPI_IRQ_WORK);
 }
 #endif
 
