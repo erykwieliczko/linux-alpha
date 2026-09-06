@@ -15,7 +15,9 @@
 #include <linux/hid.h>
 #include <linux/input/mt.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include "hid-ids.h"
@@ -158,6 +160,7 @@ struct magicmouse_sc {
 	struct input_dev *input;
 	unsigned long quirks;
 	bool query_dimensions;
+	bool mtp_c1fe;
 
 	int ntouches;
 	int scroll_accel;
@@ -755,6 +758,26 @@ static void report_finger_data(struct input_dev *input, int slot,
 	input_report_abs(input, ABS_MT_POSITION_Y, pos->y);
 }
 
+/*
+ * J700/C1FE: 32-byte header, N 30-byte contact records, 8 opaque bytes.
+ * Validate both section lengths before accessing contacts. The suffix is not
+ * padding or another contact. Never fall back to the legacy layout on failure.
+ */
+static bool magicmouse_valid_c1fe_report(const u8 *data, int size)
+{
+	unsigned int count;
+
+	if (size < 32 || data[0] != MTP_REPORT_ID ||
+	    data[2] != 32 || data[3] != 4)
+		return false;
+
+	count = data[22];
+	return count <= MAX_CONTACTS &&
+		get_unaligned_le32(data + 16) == count * sizeof(struct tp_finger) &&
+		get_unaligned_le16(data + 20) == 8 &&
+		size == 32 + count * sizeof(struct tp_finger) + 8;
+}
+
 static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size)
 {
@@ -764,7 +787,7 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	struct tp_finger *f;
 	int i, n;
 	u32 npoints;
-	const size_t hdr_sz = sizeof(struct tp_header);
+	size_t hdr_sz = sizeof(struct tp_header);
 	const size_t touch_sz = sizeof(struct tp_finger);
 	u8 map_contacs[MAX_CONTACTS];
 
@@ -772,25 +795,32 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
 	// 		     size, false);
 
-	/* Expect 46 bytes of prefix, and N * 30 bytes of touch data. */
-	if (size < hdr_sz || ((size - hdr_sz) % touch_sz) != 0)
-		return 0;
+	if (msc->mtp_c1fe) {
+		if (!magicmouse_valid_c1fe_report(data, size))
+			return 0;
+		hdr_sz = 32;
+	} else {
+		/* Legacy MTP: 38-byte header and N * 30-byte contacts. */
+		if (size < hdr_sz || ((size - hdr_sz) % touch_sz) != 0)
+			return 0;
 
-	tp_hdr = (struct tp_header *)data;
-
-	npoints = (size - hdr_sz) / touch_sz;
-	if (npoints < tp_hdr->num_fingers || npoints > MAX_CONTACTS) {
-		hid_warn(hdev,
-			 "unexpected number of touches (%u) for "
-			 "report\n",
-			 npoints);
-		return 0;
+		tp_hdr = (struct tp_header *)data;
+		npoints = (size - hdr_sz) / touch_sz;
+		if (npoints < tp_hdr->num_fingers || npoints > MAX_CONTACTS) {
+			hid_warn(hdev,
+				 "unexpected number of touches (%u) for report\n",
+				 npoints);
+			return 0;
+		}
 	}
+	/* Count and button are at the same offsets in both headers. */
+	tp_hdr = (struct tp_header *)data;
 
 	n = 0;
 	for (i = 0; i < tp_hdr->num_fingers; i++) {
 		f = (struct tp_finger *)(data + hdr_sz + i * touch_sz);
-		if (le16_to_int(f->touch_major) == 0)
+		/* C1FE presence follows the count; area/state fields are opaque. */
+		if (!msc->mtp_c1fe && le16_to_int(f->touch_major) == 0)
 			continue;
 
 		hid_dbg(hdev, "ev x:%04x y:%04x\n", le16_to_int(f->abs_x),
@@ -806,7 +836,14 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	for (i = 0; i < n; i++) {
 		int idx = map_contacs[i];
 		f = (struct tp_finger *)(data + hdr_sz + idx * touch_sz);
-		report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
+		if (msc->mtp_c1fe) {
+			input_mt_slot(input, msc->tracking_ids[i]);
+			input_mt_report_slot_state(input, MT_TOOL_FINGER, true);
+			input_report_abs(input, ABS_MT_POSITION_X, msc->pos[i].x);
+			input_report_abs(input, ABS_MT_POSITION_Y, msc->pos[i].y);
+		} else {
+			report_finger_data(input, msc->tracking_ids[i], &msc->pos[i], f);
+		}
 	}
 
 	input_mt_sync_frame(input);
@@ -1051,13 +1088,13 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 
 	mt_flags = INPUT_MT_POINTER | INPUT_MT_DROP_UNUSED | INPUT_MT_TRACK;
 
-	/* finger touch area */
-	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 5000, 0, 0);
-	input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 5000, 0, 0);
-
-	/* finger approach area */
-	input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, 5000, 0, 0);
-	input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, 5000, 0, 0);
+	if (!msc->mtp_c1fe) {
+		/* Legacy finger touch and approach area. */
+		input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 5000, 0, 0);
+		input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 5000, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, 5000, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, 5000, 0, 0);
+	}
 
 	/* Note: Touch Y position from the device is inverted relative
 	 * to how pointer motion is reported (and relative to how USB
@@ -1066,18 +1103,33 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 * inverse of the reported Y.
 	 */
 
-	input_set_abs_params(input, ABS_MT_PRESSURE, 0, 6000, 0, 0);
-
 	/*
 	 * This makes libinput recognize this as a PressurePad and
 	 * stop trying to use pressure for touch size. Pressure unit
-	 * seems to be ~grams on these touchpads.
+	 * seems to be ~grams on these touchpads. C1FE has no force sensor;
+	 * its contact tail must not be interpreted as pressure.
 	 */
-	input_abs_set_res(input, ABS_MT_PRESSURE, 1);
+	if (!msc->mtp_c1fe) {
+		input_set_abs_params(input, ABS_MT_PRESSURE, 0, 6000, 0, 0);
+		input_abs_set_res(input, ABS_MT_PRESSURE, 1);
+	}
 
-	/* finger orientation */
-	input_set_abs_params(input, ABS_MT_ORIENTATION, -J314_TP_MAX_FINGER_ORIENTATION,
-			     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
+	if (!msc->mtp_c1fe)
+		input_set_abs_params(input, ABS_MT_ORIENTATION,
+				     -J314_TP_MAX_FINGER_ORIENTATION,
+				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
+
+	/* Do not inherit unsupported axes from generic HID descriptor parsing. */
+	if (msc->mtp_c1fe) {
+		__clear_bit(ABS_MT_TOUCH_MAJOR, input->absbit);
+		__clear_bit(ABS_MT_TOUCH_MINOR, input->absbit);
+		__clear_bit(ABS_MT_WIDTH_MAJOR, input->absbit);
+		__clear_bit(ABS_MT_WIDTH_MINOR, input->absbit);
+		__clear_bit(ABS_MT_ORIENTATION, input->absbit);
+		__clear_bit(ABS_MT_PRESSURE, input->absbit);
+		__clear_bit(ABS_PRESSURE, input->absbit);
+		__clear_bit(ABS_TOOL_WIDTH, input->absbit);
+	}
 
 	/* finger position */
 	input_set_abs_params(input, ABS_MT_POSITION_X, J314_TP_MIN_X, J314_TP_MAX_X,
@@ -1308,6 +1360,11 @@ static int magicmouse_probe(struct hid_device *hdev,
 	// internal trackpad use a data format use input ops to avoid
 	// conflicts with the report ID.
 	if (id->bus == BUS_HOST) {
+		struct device_node *np;
+
+		np = of_get_child_by_name(hdev->dev.parent->of_node, "multi-touch");
+		msc->mtp_c1fe = of_device_is_compatible(np, "apple,j700-multitouch");
+		of_node_put(np);
 		msc->input_ops.raw_event = magicmouse_raw_event_mtp;
 		msc->input_ops.setup_input = magicmouse_setup_input_mtp;
 	} else if (id->bus == BUS_SPI) {
