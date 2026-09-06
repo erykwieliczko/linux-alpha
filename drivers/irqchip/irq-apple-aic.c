@@ -260,6 +260,10 @@ struct aic_info {
 	/* Features */
 	bool fast_ipi;
 	bool local_fast_ipi;
+	/* Restricted first-light capabilities; zero preserves existing targets. */
+	bool no_guest_timers;
+	bool no_pmu;
+	bool no_ipi;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -306,7 +310,23 @@ static const struct aic_info aic3_info __initconst = {
 	.local_fast_ipi = true,
 };
 
+/* T8140 MMIO is AIC3, but the M-series guest timer register write traps.
+ * PMU and IPI programming are not validated. Expose only boot-CPU host
+ * timers and external IRQs until those independent interfaces are ported.
+ */
+static const struct aic_info t8140_aic3_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.no_guest_timers = true,
+	.no_pmu = true,
+	.no_ipi = true,
+};
+
 static const struct of_device_id aic_info_match[] = {
+	{
+		.compatible = "apple,t8140-aic3",
+		.data = &t8140_aic3_info,
+	},
 	{
 		.compatible = "apple,t8103-aic",
 		.data = &aic1_local_fipi_info,
@@ -414,7 +434,7 @@ static void __exception_irq_entry aic_handle_irq(struct pt_regs *regs)
 
 		if (type == AIC_EVENT_TYPE_IRQ)
 			generic_handle_domain_irq(aic_irqc->hw_domain, event);
-		else if (type == AIC_EVENT_TYPE_IPI && irq == 1)
+		else if (type == AIC_EVENT_TYPE_IPI && irq == 1 && !ic->info.no_ipi)
 			aic_handle_ipi(regs);
 		else if (event != 0)
 			pr_err_ratelimited("Unknown IRQ event %d, %d\n", type, irq);
@@ -425,7 +445,7 @@ static void __exception_irq_entry aic_handle_irq(struct pt_regs *regs)
 	 * for them separately. It should however only trigger when NV is
 	 * in use, and be cleared when coming back from the handler.
 	 */
-	if (is_kernel_in_hyp_mode() &&
+	if (!ic->info.no_guest_timers && is_kernel_in_hyp_mode() &&
 	    (read_sysreg_s(SYS_ICH_HCR_EL2) & ICH_HCR_EL2_En) &&
 	    read_sysreg_s(SYS_ICH_MISR_EL2) != 0) {
 		u64 val;
@@ -499,6 +519,12 @@ static unsigned long aic_fiq_get_idx(struct irq_data *d)
 
 static void aic_fiq_set_mask(struct irq_data *d)
 {
+	struct aic_irq_chip *ic = irq_data_get_irq_chip_data(d);
+
+	/* Unsupported guest IRQs are rejected at domain translation/mapping. */
+	if (ic->info.no_guest_timers)
+		return;
+
 	/* Only the guest timers have real mask bits, unfortunately. */
 	switch (aic_fiq_get_idx(d)) {
 	case AIC_TMR_EL02_PHYS:
@@ -516,6 +542,11 @@ static void aic_fiq_set_mask(struct irq_data *d)
 
 static void aic_fiq_clear_mask(struct irq_data *d)
 {
+	struct aic_irq_chip *ic = irq_data_get_irq_chip_data(d);
+
+	if (ic->info.no_guest_timers)
+		return;
+
 	switch (aic_fiq_get_idx(d)) {
 	case AIC_TMR_EL02_PHYS:
 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_P);
@@ -556,6 +587,8 @@ static void aic_fiq_eoi(struct irq_data *d)
 
 static void __exception_irq_entry aic_handle_fiq(struct pt_regs *regs)
 {
+	bool host_timer = false;
+
 	/*
 	 * It would be really nice if we had a system register that lets us get
 	 * the FIQ source state without having to peek down into sources...
@@ -575,15 +608,23 @@ static void __exception_irq_entry aic_handle_fiq(struct pt_regs *regs)
 	    (read_sysreg_s(SYS_IMP_APL_IPI_SR_EL1) & IPI_SR_PENDING))
 		aic_handle_ipi(regs);
 
-	if (TIMER_FIRING(read_sysreg(cntp_ctl_el0)))
+	if (TIMER_FIRING(read_sysreg(cntp_ctl_el0))) {
+		host_timer = true;
 		generic_handle_domain_irq(aic_irqc->hw_domain,
 					  AIC_FIQ_HWIRQ(AIC_TMR_EL0_PHYS));
+	}
 
-	if (TIMER_FIRING(read_sysreg(cntv_ctl_el0)))
+	if (TIMER_FIRING(read_sysreg(cntv_ctl_el0))) {
+		host_timer = true;
 		generic_handle_domain_irq(aic_irqc->hw_domain,
 					  AIC_FIQ_HWIRQ(AIC_TMR_EL0_VIRT));
+	}
 
-	if (is_kernel_in_hyp_mode()) {
+	/* Do not return into an endless storm from an unported firmware source. */
+	if (aic_irqc->info.no_guest_timers && !host_timer)
+		panic("T8140: FIQ from an unsupported source\n");
+
+	if (!aic_irqc->info.no_guest_timers && is_kernel_in_hyp_mode()) {
 		uint64_t enabled = read_sysreg_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2);
 
 		if ((enabled & VM_TMR_FIQ_ENABLE_P) &&
@@ -597,12 +638,13 @@ static void __exception_irq_entry aic_handle_fiq(struct pt_regs *regs)
 						  AIC_FIQ_HWIRQ(AIC_TMR_EL02_VIRT));
 	}
 
-	if ((read_sysreg_s(SYS_IMP_APL_PMCR0_EL1) & (PMCR0_IMODE | PMCR0_IACT)) ==
+	if (!aic_irqc->info.no_pmu &&
+	    (read_sysreg_s(SYS_IMP_APL_PMCR0_EL1) & (PMCR0_IMODE | PMCR0_IACT)) ==
 			(FIELD_PREP(PMCR0_IMODE, PMCR0_IMODE_FIQ) | PMCR0_IACT))
 		generic_handle_domain_irq(aic_irqc->hw_domain,
 					  AIC_FIQ_HWIRQ(AIC_CPU_PMU_P));
 
-	if (static_branch_likely(&use_fast_ipi) &&
+	if (!aic_irqc->info.no_pmu && static_branch_likely(&use_fast_ipi) &&
 	    (FIELD_GET(UPMCR0_IMODE, read_sysreg_s(SYS_IMP_APL_UPMCR0_EL1)) == UPMCR0_IMODE_FIQ) &&
 	    (read_sysreg_s(SYS_IMP_APL_UPMSR_EL1) & UPMSR_IACT)) {
 		/* Same story with uncore PMCs */
@@ -645,6 +687,9 @@ static int aic_irq_domain_map(struct irq_domain *id, unsigned int irq,
 				    handle_fasteoi_irq, NULL, NULL);
 		irqd_set_single_target(irq_desc_get_irq_data(irq_to_desc(irq)));
 	} else {
+		if (ic->info.no_guest_timers && AIC_HWIRQ_IRQ(hw) != AIC_TMR_EL0_PHYS &&
+		    AIC_HWIRQ_IRQ(hw) != AIC_TMR_EL0_VIRT)
+			return -EOPNOTSUPP;
 		irq_set_percpu_devid(irq);
 		irq_domain_set_info(id, irq, hw, &fiq_chip, id->host_data,
 				    handle_percpu_devid_irq, NULL, NULL);
@@ -661,6 +706,9 @@ static int aic_irq_get_fwspec_info(struct irq_fwspec *fwspec, struct irq_fwspec_
 	info->flags = 0;
 	info->affinity = NULL;
 
+	if (fwspec->param_count < 3 || fwspec->param_count > 4)
+		return -EINVAL;
+
 	if (fwspec->param[0] != AIC_FIQ)
 		return 0;
 
@@ -668,6 +716,14 @@ static int aic_irq_get_fwspec_info(struct irq_fwspec *fwspec, struct irq_fwspec_
 		intid = fwspec->param[1];
 	else
 		intid = fwspec->param[2];
+
+	if (intid >= AIC_NR_FIQ)
+		return -EINVAL;
+	if (aic_irqc->info.no_guest_timers &&
+	    (!is_kernel_in_hyp_mode() ||
+	     (fwspec->param_count == 4 && fwspec->param[1]) ||
+	     (intid != AIC_TMR_HV_PHYS && intid != AIC_TMR_HV_VIRT)))
+		return -EOPNOTSUPP;
 
 	if (aic_irqc->fiq_aff[intid])
 		mask = &aic_irqc->fiq_aff[intid]->aff;
@@ -713,6 +769,10 @@ static int aic_irq_domain_translate(struct irq_domain *id,
 			return -EINVAL;
 		if (args[0] >= AIC_NR_FIQ)
 			return -EINVAL;
+		if (ic->info.no_guest_timers &&
+		    (!is_kernel_in_hyp_mode() ||
+		     (args[0] != AIC_TMR_HV_PHYS && args[0] != AIC_TMR_HV_VIRT)))
+			return -EOPNOTSUPP;
 		*hwirq = AIC_FIQ_HWIRQ(args[0]);
 
 		/*
@@ -759,6 +819,13 @@ static int aic_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
 	ret = aic_irq_domain_translate(domain, fwspec, &hwirq, &type);
 	if (ret)
 		return ret;
+
+	/* First-light T8140 consumers request individual IRQs. Reject ranges
+	 * before installing any handlers, including ranges crossing capabilities.
+	 */
+	if (((struct aic_irq_chip *)domain->host_data)->info.no_guest_timers &&
+	    nr_irqs != 1)
+		return -EOPNOTSUPP;
 
 	for (i = 0; i < nr_irqs; i++) {
 		ret = aic_irq_domain_map(domain, virq + i, hwirq + i);
@@ -847,6 +914,14 @@ static int __init aic_init_smp(struct aic_irq_chip *irqc, struct device_node *no
 {
 	int base_ipi;
 
+	if (irqc->info.no_ipi) {
+		if (num_possible_cpus() != 1) {
+			pr_err("T8140 requires one possible CPU: IPIs are not supported\n");
+			return -EOPNOTSUPP;
+		}
+		return 0;
+	}
+
 	base_ipi = ipi_mux_create(AIC_NR_SWIPI, aic_ipi_send_single);
 	if (WARN_ON(base_ipi <= 0))
 		return -ENODEV;
@@ -869,7 +944,7 @@ static int aic_init_cpu(unsigned int cpu)
 	sysreg_clear_set(cntv_ctl_el0, 0, ARCH_TIMER_CTRL_IT_MASK);
 
 	/* EL2-only (VHE mode) IRQ sources */
-	if (is_kernel_in_hyp_mode()) {
+	if (!aic_irqc->info.no_guest_timers && is_kernel_in_hyp_mode()) {
 		/* Guest timers */
 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
 				   VM_TMR_FIQ_ENABLE_V | VM_TMR_FIQ_ENABLE_P, 0);
@@ -879,11 +954,12 @@ static int aic_init_cpu(unsigned int cpu)
 	}
 
 	/* PMC FIQ */
-	sysreg_clear_set_s(SYS_IMP_APL_PMCR0_EL1, PMCR0_IMODE | PMCR0_IACT,
-			   FIELD_PREP(PMCR0_IMODE, PMCR0_IMODE_OFF));
+	if (!aic_irqc->info.no_pmu)
+		sysreg_clear_set_s(SYS_IMP_APL_PMCR0_EL1, PMCR0_IMODE | PMCR0_IACT,
+				   FIELD_PREP(PMCR0_IMODE, PMCR0_IMODE_OFF));
 
 	/* Uncore PMC FIQ */
-	if (static_branch_likely(&use_fast_ipi)) {
+	if (!aic_irqc->info.no_pmu && static_branch_likely(&use_fast_ipi)) {
 		sysreg_clear_set_s(SYS_IMP_APL_UPMCR0_EL1, UPMCR0_IMODE,
 				   FIELD_PREP(UPMCR0_IMODE, UPMCR0_IMODE_OFF));
 	}
@@ -989,6 +1065,11 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 		goto err_unmap;
 
 	irqc->info = *(struct aic_info *)match->data;
+
+	if (irqc->info.no_guest_timers && !is_kernel_in_hyp_mode()) {
+		pr_err("T8140 first-light timer support requires EL2 VHE\n");
+		goto err_unmap;
+	}
 
 	aic_irqc = irqc;
 
@@ -1099,7 +1180,7 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
 
-	if (is_kernel_in_hyp_mode()) {
+	if (!irqc->info.no_guest_timers && is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {
 			.fwnode		= of_fwnode_handle(node),
 			.param_count	= 3,
@@ -1114,10 +1195,13 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 		WARN_ON(!vgic_info.maint_irq);
 	}
 
-	vgic_set_kvm_info(&vgic_info);
+	if (!irqc->info.no_guest_timers)
+		vgic_set_kvm_info(&vgic_info);
 
 	pr_info("Initialized with %d/%d IRQs * %d/%d die(s), %d FIQs, %d vIPIs",
-		irqc->nr_irq, irqc->max_irq, irqc->nr_die, irqc->max_die, AIC_NR_FIQ, AIC_NR_SWIPI);
+		irqc->nr_irq, irqc->max_irq, irqc->nr_die, irqc->max_die,
+		irqc->info.no_guest_timers ? 2 : AIC_NR_FIQ,
+		irqc->info.no_ipi ? 0 : AIC_NR_SWIPI);
 
 	return 0;
 

@@ -2876,6 +2876,38 @@ static int __init apple_s5l_early_console_setup(struct earlycon_device *device,
 }
 
 OF_EARLYCON_DECLARE(s5l, "apple,s5l-uart", apple_s5l_early_console_setup);
+
+/* T8140's inherited debug UART uses UTRSTAT readiness, not the old FIFO
+ * status layout. Keep firmware's clock, divisor, FIFO and control state.
+ */
+static void apple_t8140_early_putc(struct uart_port *port, unsigned char c)
+{
+	while (!(readl(port->membase + S3C2410_UTRSTAT) & BIT(1)))
+		cpu_relax();
+	writel(c, port->membase + S3C2410_UTXH);
+}
+
+static void apple_t8140_early_write(struct console *con, const char *s,
+				  unsigned int n)
+{
+	struct earlycon_device *dev = con->data;
+
+	uart_console_write(&dev->port, s, n, apple_t8140_early_putc);
+}
+
+static int __init apple_t8140_early_console_setup(struct earlycon_device *device,
+					       const char *opt)
+{
+	int ret = apple_s5l_early_console_setup(device, opt);
+
+	if (ret)
+		return ret;
+	device->con->write = apple_t8140_early_write;
+	device->con->read = NULL;
+	return 0;
+}
+
+OF_EARLYCON_DECLARE(s5l_t8140, "apple,t8140-uart", apple_t8140_early_console_setup);
 #endif
 
 MODULE_ALIAS("platform:samsung-uart");
