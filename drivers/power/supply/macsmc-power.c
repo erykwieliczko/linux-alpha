@@ -106,6 +106,8 @@ struct macsmc_power {
 	 */
 	bool fw_ge_27;
 	bool is_j713;
+	/* J700 telemetry is qualified; charge-policy writes are not. */
+	bool is_j700;
 	bool j713_status_keys_valid;
 	bool j713_has_b0ac;
 	bool j713_has_b0ap;
@@ -567,8 +569,103 @@ static int macsmc_battery_get_capacity_level(struct macsmc_power *power)
 
 static s16 macsmc_swap_b0rm(struct macsmc_power *power, s16 b0rm)
 {
+	/*
+	 * J700 has little-endian B0RM even with the four-byte BCF0 key.
+	 * Hardware: bytes 47 25 at full charge match B0FC = 9543 mAh;
+	 * swapping incorrectly reports 18213 mAh. BCF0 width stays independent.
+	 */
+	if (power->is_j700)
+		return b0rm;
 	/* B0RM was Big Endian, likely pass through from TI gas gauge */
 	return power->fw_ge_27 ? b0rm : (s16)swab16(b0rm);
+}
+
+/* Do not advertise absent firmware keys: one failed field aborts a uevent. */
+static bool macsmc_key_readable(struct macsmc_power *power, smc_key key, u8 size)
+{
+	struct apple_smc_key_info info;
+	u8 value[MAX_STRING_LENGTH];
+
+	if (apple_smc_get_key_info(power->smc, key, &info) ||
+	    !(info.flags & APPLE_SMC_READABLE) || !info.size ||
+	    (size && info.size != size))
+		return false;
+
+	return apple_smc_read(power->smc, key, value, info.size) == info.size;
+}
+
+static bool macsmc_j700_property_available(struct macsmc_power *power,
+					 enum power_supply_property prop)
+{
+	static const struct {
+		enum power_supply_property prop;
+		smc_key key;
+		u8 size;
+		bool needs_cells;
+	} keys[] = {
+		{ POWER_SUPPLY_PROP_VOLTAGE_NOW, SMC_KEY(B0AV), 2 },
+		{ POWER_SUPPLY_PROP_CURRENT_NOW, SMC_KEY(B0AC), 2 },
+		{ POWER_SUPPLY_PROP_POWER_NOW, SMC_KEY(B0AP), 4 },
+		{ POWER_SUPPLY_PROP_CAPACITY, SMC_KEY(BUIC), 1 },
+		{ POWER_SUPPLY_PROP_TEMP, SMC_KEY(B0AT), 2 },
+		{ POWER_SUPPLY_PROP_CYCLE_COUNT, SMC_KEY(B0CT), 2 },
+		{ POWER_SUPPLY_PROP_HEALTH, SMC_KEY(BBAD), 1 },
+		{ POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW, SMC_KEY(B0TE), 2 },
+		{ POWER_SUPPLY_PROP_TIME_TO_FULL_NOW, SMC_KEY(B0TF), 2 },
+		{ POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN, SMC_KEY(BITV), 2 },
+		{ POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN, SMC_KEY(BVVN), 2, true },
+		{ POWER_SUPPLY_PROP_VOLTAGE_MIN, SMC_KEY(BLPM), 2 },
+		{ POWER_SUPPLY_PROP_VOLTAGE_MAX, SMC_KEY(BLPX), 2 },
+		{ POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT, SMC_KEY(B0RC), 2 },
+		{ POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX, SMC_KEY(B0RI), 2 },
+		{ POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE, SMC_KEY(B0RV), 2 },
+		{ POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN, SMC_KEY(B0DC), 2 },
+		{ POWER_SUPPLY_PROP_CHARGE_FULL, SMC_KEY(B0FC), 2 },
+		{ POWER_SUPPLY_PROP_CHARGE_NOW, SMC_KEY(B0RM), 2 },
+		{ POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN, SMC_KEY(B0DC), 2, true },
+		{ POWER_SUPPLY_PROP_ENERGY_FULL, SMC_KEY(B0FC), 2, true },
+		{ POWER_SUPPLY_PROP_ENERGY_NOW, SMC_KEY(B0RM), 2, true },
+		{ POWER_SUPPLY_PROP_CHARGE_COUNTER, SMC_KEY(BAAC), 8 },
+	};
+	size_t i;
+
+	switch (prop) {
+	case POWER_SUPPLY_PROP_STATUS:
+	case POWER_SUPPLY_PROP_PRESENT:
+	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+	case POWER_SUPPLY_PROP_SCOPE:
+		return true;
+	case POWER_SUPPLY_PROP_MODEL_NAME:
+		return power->model_name[0] && macsmc_key_readable(power, SMC_KEY(BMDN), 0);
+	case POWER_SUPPLY_PROP_SERIAL_NUMBER:
+		return power->serial_number[0] && macsmc_key_readable(power, SMC_KEY(BMSN), 0);
+	case POWER_SUPPLY_PROP_MANUFACTURE_YEAR:
+	case POWER_SUPPLY_PROP_MANUFACTURE_MONTH:
+	case POWER_SUPPLY_PROP_MANUFACTURE_DAY:
+		/* Captured J700 BMDT "900618" has no qualified calendar encoding. */
+		return false;
+	default:
+		break;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(keys); i++) {
+		if (keys[i].prop == prop)
+			return (!keys[i].needs_cells || power->num_cells) &&
+			       macsmc_key_readable(power, keys[i].key, keys[i].size);
+	}
+	return false;
+}
+
+static size_t macsmc_j700_filter_properties(struct macsmc_power *power,
+					  enum power_supply_property *props,
+					  size_t count)
+{
+	size_t src, dst = 0;
+
+	for (src = 0; src < count; src++)
+		if (macsmc_j700_property_available(power, props[src]))
+			props[dst++] = props[src];
+	return dst;
 }
 
 static int macsmc_battery_get_property(struct power_supply *psy,
@@ -577,11 +674,11 @@ static int macsmc_battery_get_property(struct power_supply *psy,
 {
 	struct macsmc_power *power = power_supply_get_drvdata(psy);
 	int ret = 0;
-	u8 vu8;
-	u16 vu16;
-	s16 vs16;
-	s32 vs32;
-	s64 vs64;
+	u8 vu8 = 0;
+	u16 vu16 = 0;
+	s16 vs16 = 0;
+	s32 vs32 = 0;
+	s64 vs64 = 0;
 	bool flag;
 
 	if (power->is_j713)
@@ -625,7 +722,7 @@ static int macsmc_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_POWER_NOW:
 		ret = apple_smc_read_s32(power->smc, SMC_KEY(B0AP), &vs32);
-		val->intval = vs32 * 1000;
+		val->intval = clamp_t(s64, (s64)vs32 * 1000, INT_MIN, INT_MAX);
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
 		ret = apple_smc_read_u16(power->smc, SMC_KEY(BITV), &vu16);
@@ -750,7 +847,7 @@ static int macsmc_battery_set_property(struct power_supply *psy,
 {
 	struct macsmc_power *power = power_supply_get_drvdata(psy);
 
-	if (power->is_j713)
+	if (power->is_j713 || power->is_j700)
 		return -EOPNOTSUPP;
 
 	switch (psp) {
@@ -788,7 +885,7 @@ static int macsmc_battery_property_is_writeable(struct power_supply *psy,
 {
 	struct macsmc_power *power = power_supply_get_drvdata(psy);
 
-	if (power->is_j713)
+	if (power->is_j713 || power->is_j700)
 		return false;
 
 	switch (psp) {
@@ -841,8 +938,8 @@ static int macsmc_ac_get_property(struct power_supply *psy,
 {
 	struct macsmc_power *power = power_supply_get_drvdata(psy);
 	int ret = 0;
-	u16 vu16;
-	u32 vu32;
+	u16 vu16 = 0;
+	u32 vu32 = 0;
 
 	if (power->is_j713)
 		return macsmc_j713_ac_get_property(power, psp, val);
@@ -1208,6 +1305,8 @@ static int macsmc_power_probe(struct platform_device *pdev)
 	power->smc = smc;
 	power->is_j713 = of_machine_is_compatible("apple,j713") &&
 		of_device_is_compatible(dev->parent->of_node, "apple,t8132-smc");
+	power->is_j700 = of_machine_is_compatible("apple,j700") &&
+		of_device_is_compatible(dev->parent->of_node, "apple,t8140-smc");
 	dev_set_drvdata(dev, power);
 
 	INIT_WORK(&power->critical_work, macsmc_power_critical_work);
@@ -1232,7 +1331,8 @@ static int macsmc_power_probe(struct platform_device *pdev)
 	 * Check for AC adapter presence.
 	 * CHIS is a fundamental key.
 	 */
-	if (apple_smc_key_exists(smc, SMC_KEY(CHIS)))
+	if (power->is_j700 ? macsmc_key_readable(power, SMC_KEY(CHIS), 4) :
+	    apple_smc_key_exists(smc, SMC_KEY(CHIS)))
 		has_ac_adapter = true;
 
 	if (!has_battery && !has_ac_adapter)
@@ -1307,19 +1407,22 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		}
 
 		/* Reset "Optimised Battery Charging" flags to default state */
-		if (power->has_chte)
-			apple_smc_write_u32(smc, SMC_KEY(CHTE), 0);
-		else if (power->has_ch0c)
-			apple_smc_write_u8(smc, SMC_KEY(CH0C), 0);
+		if (!power->is_j700) {
+			if (power->has_chte)
+				apple_smc_write_u32(smc, SMC_KEY(CHTE), 0);
+			else if (power->has_ch0c)
+				apple_smc_write_u8(smc, SMC_KEY(CH0C), 0);
 
-		if (power->has_ch0i)
-			apple_smc_write_u8(smc, SMC_KEY(CH0I), 0);
+			if (power->has_ch0i)
+				apple_smc_write_u8(smc, SMC_KEY(CH0I), 0);
 
-		apple_smc_write_u8(smc, SMC_KEY(CH0K), 0);
-		apple_smc_write_u8(smc, SMC_KEY(CH0B), 0);
+			apple_smc_write_u8(smc, SMC_KEY(CH0K), 0);
+			apple_smc_write_u8(smc, SMC_KEY(CH0B), 0);
+		}
 
 		/* Configure charge behaviour if supported */
-		if (power->has_ch0i || power->has_ch0c || power->has_chte) {
+		if (!power->is_j700 &&
+		    (power->has_ch0i || power->has_ch0c || power->has_chte)) {
 			props[nprops++] = POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR;
 
 			power->batt_desc.charge_behaviours =
@@ -1340,7 +1443,7 @@ static int macsmc_power_probe(struct platform_device *pdev)
 		else if (apple_smc_read_u16(power->smc, SMC_KEY(CHLS), &vu16) >= 0)
 			power->has_chls = true;
 
-		if (power->has_chwa || power->has_chls) {
+		if (!power->is_j700 && (power->has_chwa || power->has_chls)) {
 			props[nprops++] = POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
 			props[nprops++] = POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD;
 		}
@@ -1360,7 +1463,12 @@ static int macsmc_power_probe(struct platform_device *pdev)
 			       sizeof(power->mfg_date) - 1);
 
 		apple_smc_read_u8(power->smc, SMC_KEY(BNCB), &power->num_cells);
+		if (power->is_j700 && !macsmc_key_readable(power, SMC_KEY(BNCB), 1))
+			power->num_cells = 0;
 		power->nominal_voltage_mv = MACSMC_NOMINAL_CELL_VOLTAGE_MV * power->num_cells;
+		if (power->is_j700)
+			power->batt_desc.num_properties =
+				macsmc_j700_filter_properties(power, props, nprops);
 
 		/* Enable critical shutdown notifications by reading status once */
 		macsmc_battery_read_bcf0(power, &val32);
@@ -1403,6 +1511,18 @@ static int macsmc_power_probe(struct platform_device *pdev)
 
 		power->ac_desc.properties = props;
 		power->ac_desc.num_properties = nprops;
+		if (power->is_j700) {
+			/* AC voltage and current are independent optional keys. */
+			nprops = 0;
+			props[nprops++] = POWER_SUPPLY_PROP_ONLINE;
+			if (macsmc_key_readable(power, SMC_KEY(ACPW), 4))
+				props[nprops++] = POWER_SUPPLY_PROP_INPUT_POWER_LIMIT;
+			if (macsmc_key_readable(power, SMC_KEY(AC-n), 2))
+				props[nprops++] = POWER_SUPPLY_PROP_VOLTAGE_NOW;
+			if (macsmc_key_readable(power, SMC_KEY(AC-i), 2))
+				props[nprops++] = POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+			power->ac_desc.num_properties = nprops;
+		}
 
 		psy_cfg.drv_data = power;
 		power->ac = devm_power_supply_register(dev, &power->ac_desc, &psy_cfg);
